@@ -8,57 +8,52 @@ use std::time::Duration;
 use anyhow::anyhow;
 use bytes::Bytes;
 use hmac::{Hmac, Mac};
-use libaes::{Cipher, AES_256_KEY_LEN};
+use libaes::{AES_256_KEY_LEN, Cipher};
 use p256::ecdh::diffie_hellman;
 use p256::elliptic_curve::sec1::{FromEncodedPoint, ToEncodedPoint};
 use p256::{EncodedPoint, PublicKey};
 use prost::Message;
 use rand::Rng;
-use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256, Sha512};
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 use tokio::sync::broadcast::error::TryRecvError;
 use tokio::sync::broadcast::{Receiver, Sender};
-#[cfg(feature = "ts-support")]
-use ts_rs::TS;
 
-use super::info::{InternalFileInfo, TransferMetadata};
-use super::{InnerState, State};
-use crate::channel::{ChannelAction, ChannelDirection, ChannelMessage};
+use super::info::{InternalFileInfo, TransferMetadata, TransferPayload, TransferPayloadKind};
+use super::{InnerState, TransferState};
+use crate::channel::{self, ChannelMessage, MessageClient, TransferAction, TransferKind};
 use crate::location_nearby_connections::bandwidth_upgrade_negotiation_frame::upgrade_path_info::Medium;
 use crate::location_nearby_connections::connection_response_frame::ResponseStatus;
 use crate::location_nearby_connections::payload_transfer_frame::{
-    payload_header, PacketType, PayloadChunk, PayloadHeader,
+    PacketType, PayloadChunk, PayloadHeader, payload_header,
 };
 use crate::location_nearby_connections::{KeepAliveFrame, OfflineFrame, PayloadTransferFrame};
 use crate::securegcm::ukey2_alert::AlertType;
 use crate::securegcm::ukey2_client_init::CipherCommitment;
 use crate::securegcm::{
-    ukey2_message, DeviceToDeviceMessage, GcmMetadata, Type, Ukey2Alert, Ukey2ClientFinished,
-    Ukey2ClientInit, Ukey2HandshakeCipher, Ukey2Message, Ukey2ServerInit,
+    DeviceToDeviceMessage, GcmMetadata, Type, Ukey2Alert, Ukey2ClientFinished, Ukey2ClientInit,
+    Ukey2HandshakeCipher, Ukey2Message, Ukey2ServerInit, ukey2_message,
 };
 use crate::securemessage::{
     EcP256PublicKey, EncScheme, GenericPublicKey, Header, HeaderAndBody, PublicKeyType,
     SecureMessage, SigScheme,
 };
 use crate::sharing_nearby::{
-    file_metadata, paired_key_result_frame, FileMetadata, IntroductionFrame,
+    FileMetadata, IntroductionFrame, file_metadata, paired_key_result_frame,
 };
 use crate::utils::{
-    encode_point, gen_ecdsa_keypair, gen_random, hkdf_extract_expand, stream_read_exact,
-    to_four_digit_string, DeviceType, RemoteDeviceInfo,
+    DeviceType, RemoteDeviceInfo, encode_point, gen_ecdsa_keypair, gen_random, hkdf_extract_expand,
+    stream_read_exact, to_four_digit_string,
 };
-use crate::{location_nearby_connections, sharing_nearby, DEVICE_NAME};
+use crate::{DEVICE_NAME, location_nearby_connections, sharing_nearby};
 
 type HmacSha256 = Hmac<Sha256>;
 
 const SANE_FRAME_LENGTH: i32 = 5 * 1024 * 1024;
 const SANITY_DURATION: Duration = Duration::from_micros(10);
 
-#[derive(Debug, Deserialize, Serialize)]
-#[cfg_attr(feature = "ts-support", derive(TS))]
-#[cfg_attr(feature = "ts-support", ts(export))]
+#[derive(Debug, Clone)]
 pub enum OutboundPayload {
     Files(Vec<String>),
 }
@@ -92,13 +87,17 @@ impl OutboundRequest {
                 id,
                 server_seq: 0,
                 client_seq: 0,
-                state: State::Initial,
+                state: TransferState::Initial,
                 encryption_done: true,
                 transfer_metadata: Some(TransferMetadata {
-                    id: String::from(""),
                     source: Some(rdi),
-                    files: Some(files.to_owned()),
-                    ..Default::default()
+                    payload_kind: TransferPayloadKind::Files,
+                    payload: Some(TransferPayload::Files(files.to_vec())),
+                    id: Default::default(),
+                    pin_code: Default::default(),
+                    payload_preview: Default::default(),
+                    total_bytes: Default::default(),
+                    ack_bytes: Default::default(),
                 }),
                 ..Default::default()
             },
@@ -116,30 +115,25 @@ impl OutboundRequest {
             i = self.receiver.recv() => {
                 match i {
                     Ok(channel_msg) => {
-                        if channel_msg.direction == ChannelDirection::LibToFront {
-                            return Ok(());
-                        }
-
                         if channel_msg.id != self.state.id {
                             return Ok(());
                         }
 
-                        debug!("outbound: got: {:?}", channel_msg);
-                        match channel_msg.action {
-                            Some(ChannelAction::CancelTransfer) => {
-                                self.update_state(
-                                    |e| {
-                                        e.state = State::Cancelled;
-                                    },
-                                    true,
-                                ).await;
-                                self.disconnection().await?;
-                                return Err(anyhow!(crate::errors::AppError::NotAnError));
-                            },
-                            None => {
-                                trace!("inbound: nothing to do")
-                            },
-                            _ => {}
+                        if let channel::Message::Lib { action }  = &channel_msg.msg {
+                            debug!("outbound: got: {:?}", channel_msg);
+                            match action {
+                                TransferAction::TransferCancel => {
+                                    self.update_state(
+                                        |e| {
+                                            e.state = TransferState::Cancelled;
+                                        },
+                                        true,
+                                    ).await;
+                                    self.disconnection().await?;
+                                    return Err(anyhow!(crate::errors::AppError::NotAnError));
+                                },
+                                _ => {}
+                            }
                         }
                     }
                     Err(e) => {
@@ -172,7 +166,7 @@ impl OutboundRequest {
         let current_state = &self.state;
         // Now determine what will be the request type based on current state
         match current_state.state {
-            State::SentUkeyClientInit => {
+            TransferState::SentUkeyClientInit => {
                 debug!("Handling State::SentUkeyClientInit frame");
                 let msg = Ukey2Message::decode(&*frame_data)?;
                 self.update_state(
@@ -187,14 +181,14 @@ impl OutboundRequest {
                 // Advance current state
                 self.update_state(
                     |e: &mut InnerState| {
-                        e.state = State::SentUkeyClientFinish;
+                        e.state = TransferState::SentUkeyClientFinish;
                         e.encryption_done = true;
                     },
                     false,
                 )
                 .await;
             }
-            State::SentUkeyClientFinish => {
+            TransferState::SentUkeyClientFinish => {
                 debug!("Handling State::SentUkeyClientFinish frame");
                 let frame = location_nearby_connections::OfflineFrame::decode(&*frame_data)?;
                 self.process_connection_response(&frame).await?;
@@ -202,7 +196,7 @@ impl OutboundRequest {
                 // Advance current state
                 self.update_state(
                     |e: &mut InnerState| {
-                        e.state = State::SentPairedKeyEncryption;
+                        e.state = TransferState::SentPairedKeyEncryption;
                         e.server_init_data = Some(frame_data);
                         e.encryption_done = true;
                     },
@@ -297,7 +291,7 @@ impl OutboundRequest {
 
         self.update_state(
             |e| {
-                e.state = State::SentUkeyClientInit;
+                e.state = TransferState::SentUkeyClientInit;
                 e.private_key = Some(secret_key);
                 e.public_key = Some(public_key);
                 e.client_init_msg_data = Some(frame.encode_to_vec());
@@ -511,8 +505,8 @@ impl OutboundRequest {
                         if (chunk.flags() & 1) == 1 {
                             debug!("Chunk flags & 1 == 1 ?? End of data ??");
 
-                            let innner_frame = sharing_nearby::Frame::decode(buffer.as_slice())?;
-                            self.process_transfer_setup(&innner_frame).await?;
+                            let inner_frame = sharing_nearby::Frame::decode(buffer.as_slice())?;
+                            self.process_transfer_setup(&inner_frame).await?;
                         }
                     }
                     payload_header::PayloadType::File => {
@@ -554,7 +548,7 @@ impl OutboundRequest {
             info!("Transfer canceled");
             self.update_state(
                 |e| {
-                    e.state = State::Cancelled;
+                    e.state = TransferState::Cancelled;
                 },
                 true,
             )
@@ -564,33 +558,33 @@ impl OutboundRequest {
         }
 
         match self.state.state {
-            State::SentPairedKeyEncryption => {
+            TransferState::SentPairedKeyEncryption => {
                 debug!("Processing State::SentPairedKeyEncryption");
                 self.process_paired_key_encryption_frame(v1_frame).await?;
                 self.update_state(
                     |e| {
-                        e.state = State::SentPairedKeyResult;
+                        e.state = TransferState::SentPairedKeyResult;
                     },
                     false,
                 )
                 .await;
             }
-            State::SentPairedKeyResult => {
+            TransferState::SentPairedKeyResult => {
                 debug!("Processing State::SentPairedKeyResult");
                 self.process_paired_key_result(v1_frame).await?;
                 self.update_state(
                     |e| {
-                        e.state = State::SentIntroduction;
+                        e.state = TransferState::SentIntroduction;
                     },
                     true,
                 )
                 .await;
             }
-            State::SentIntroduction => {
+            TransferState::SentIntroduction => {
                 debug!("Processing State::SentIntroduction");
                 self.process_consent(v1_frame).await?;
             }
-            State::SendingFiles => {}
+            TransferState::SendingFiles => {}
             _ => {
                 info!(
                     "Unhandled connection state in process_transfer_setup: {:?}",
@@ -749,7 +743,7 @@ impl OutboundRequest {
                 info!("State is now State::SendingFiles");
                 self.update_state(
                     |e| {
-                        e.state = State::SendingFiles;
+                        e.state = TransferState::SendingFiles;
                     },
                     true,
                 )
@@ -768,7 +762,7 @@ impl OutboundRequest {
                             info!("All files have been transferred");
                             self.update_state(
                                 |e| {
-                                    e.state = State::Finished;
+                                    e.state = TransferState::Finished;
                                 },
                                 true,
                             )
@@ -786,26 +780,24 @@ impl OutboundRequest {
                         // Thus, we need to check for cancellation here.
                         match self.receiver.try_recv() {
                             Ok(channel_msg) => {
-                                if channel_msg.direction == ChannelDirection::FrontToLib
-                                    && channel_msg.id == self.state.id
-                                {
-                                    debug!("outbound: got: {:?}", channel_msg);
-                                    match channel_msg.action {
-                                        Some(ChannelAction::CancelTransfer) => {
-                                            self.update_state(
-                                                |e| {
-                                                    e.state = State::Cancelled;
-                                                },
-                                                true,
-                                            )
-                                            .await;
-                                            self.disconnection().await?;
-                                            break 'send_all_files;
+                                if channel_msg.id == self.state.id {
+                                    // TODO: if-let chains will be available in 1.88
+                                    if let channel::Message::Lib { action } = &channel_msg.msg {
+                                        debug!("outbound: got: {:?}", channel_msg);
+                                        match action {
+                                            TransferAction::TransferCancel => {
+                                                self.update_state(
+                                                    |e| {
+                                                        e.state = TransferState::Cancelled;
+                                                    },
+                                                    true,
+                                                )
+                                                .await;
+                                                self.disconnection().await?;
+                                                break 'send_all_files;
+                                            }
+                                            _ => {}
                                         }
-                                        None => {
-                                            trace!("inbound: nothing to do")
-                                        }
-                                        _ => {}
                                     }
                                 }
                             }
@@ -865,7 +857,7 @@ impl OutboundRequest {
                             "> File ready: {bytes_read} bytes && {} && left to send: {} with current offset: {}",
                             sending_buffer.len(),
                             curr_state.total_size - curr_state.bytes_transferred,
-							curr_state.bytes_transferred
+                            curr_state.bytes_transferred
                         );
 
                         let payload_header = PayloadHeader {
@@ -960,7 +952,7 @@ impl OutboundRequest {
                 );
                 self.update_state(
                     |e| {
-                        e.state = State::Disconnected;
+                        e.state = TransferState::Disconnected;
                     },
                     true,
                 )
@@ -972,7 +964,7 @@ impl OutboundRequest {
                 error!("Unknown consent type: aborting");
                 self.update_state(
                     |e| {
-                        e.state = State::Disconnected;
+                        e.state = TransferState::Disconnected;
                     },
                     true,
                 )
@@ -1284,11 +1276,11 @@ impl OutboundRequest {
 
         let _ = self.sender.send(ChannelMessage {
             id: self.state.id.clone(),
-            direction: ChannelDirection::LibToFront,
-            rtype: Some(crate::channel::TransferType::Outbound),
-            state: Some(self.state.state.clone()),
-            meta: self.state.transfer_metadata.clone(),
-            ..Default::default()
+            msg: channel::Message::Client(MessageClient {
+                kind: TransferKind::Outbound,
+                state: Some(self.state.state.clone()),
+                metadata: self.state.transfer_metadata.clone(),
+            }),
         });
         // Add a small sleep timer to allow the Tokio runtime to have
         // some spare time to process channel's message. Otherwise it
