@@ -1,5 +1,6 @@
 use std::fs::File;
 use std::os::unix::fs::FileExt;
+use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::{Context, anyhow};
@@ -883,7 +884,31 @@ impl InboundRequest {
                     dest.pop();
 
                     loop {
-                        dest.push(format!("{}_{}", counter, file.name()));
+                        // How name conflict resolution happens in most software,
+                        // lorem.txt
+                        // lorem (1).txt
+                        // ...
+                        let incremented_file_path = {
+                            let file_path = PathBuf::from(file.name());
+
+                            let incremented_file_stem = format!(
+                                "{} ({counter})",
+                                file_path
+                                    .file_stem()
+                                    .and_then(|it| it.to_str())
+                                    .expect("Must be UTF-8 since Path is derived from String"),
+                            );
+
+                            let incremented_file_path =
+                                file_path.with_file_name(incremented_file_stem);
+
+                            file_path
+                                .extension()
+                                .map(|it| incremented_file_path.with_extension(it))
+                                .unwrap_or_else(|| incremented_file_path)
+                        };
+
+                        dest.push(incremented_file_path);
                         if !dest.exists() {
                             break;
                         }
