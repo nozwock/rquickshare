@@ -2,8 +2,8 @@ use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 
 use anyhow::anyhow;
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use bytes::Bytes;
 use get_if_addrs::get_if_addrs;
 use hkdf::Hkdf;
@@ -212,6 +212,19 @@ pub fn is_not_self_ip(ip_address: &Ipv4Addr) -> bool {
     }
 
     true
+}
+
+pub fn create_text_preview(text: &str, max_chars: usize) -> String {
+    // Flatten newlines so the preview renders cleanly on a single line
+    let single_line = text.lines().next().unwrap_or("").trim();
+
+    let char_count = single_line.chars().count();
+    if char_count <= max_chars {
+        single_line.to_string()
+    } else {
+        let truncated: String = single_line.chars().take(max_chars).collect();
+        format!("{truncated}…")
+    }
 }
 
 #[cfg(test)]

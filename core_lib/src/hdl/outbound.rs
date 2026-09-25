@@ -43,8 +43,8 @@ use crate::sharing_nearby::{
     FileMetadata, IntroductionFrame, TextMetadata, file_metadata, paired_key_result_frame,
 };
 use crate::utils::{
-    DeviceType, RemoteDeviceInfo, encode_point, gen_ecdsa_keypair, gen_random, hkdf_extract_expand,
-    stream_read_exact, to_four_digit_string,
+    DeviceType, RemoteDeviceInfo, create_text_preview, encode_point, gen_ecdsa_keypair, gen_random,
+    hkdf_extract_expand, stream_read_exact, to_four_digit_string,
 };
 use crate::{DEVICE_NAME, location_nearby_connections, sharing_nearby};
 
@@ -115,7 +115,7 @@ impl OutboundRequest {
                     payload: Some(transfer_payload),
                     id: Default::default(),
                     pin_code: Default::default(),
-                    payload_preview: Some(text.clone()),
+                    payload_preview: Some(create_text_preview(text, 32).clone()),
                     total_bytes: text.len() as u64,
                     ack_bytes: Default::default(),
                 }
