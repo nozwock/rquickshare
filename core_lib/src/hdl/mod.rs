@@ -90,7 +90,7 @@ pub enum TextPayloadInfo {
     Wifi((i64, String, SecurityType)), // id, ssid, security type
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum TextPayloadType {
     Url,
     Text,
