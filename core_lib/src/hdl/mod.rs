@@ -98,11 +98,33 @@ pub enum TextPayloadType {
 }
 
 impl TextPayloadInfo {
-    fn get_i64_value(&self) -> i64 {
+    pub fn get_i64_value(&self) -> i64 {
         match self {
             TextPayloadInfo::Url(value)
             | TextPayloadInfo::Text(value)
             | TextPayloadInfo::Wifi((value, _, _)) => value.to_owned(),
+        }
+    }
+
+    pub fn from_type(text_type: &TextPayloadType, payload_id: i64) -> Self {
+        match text_type {
+            TextPayloadType::Url => TextPayloadInfo::Url(payload_id),
+            TextPayloadType::Text => TextPayloadInfo::Text(payload_id),
+            TextPayloadType::Wifi => TextPayloadInfo::Wifi((
+                payload_id,
+                String::new(),
+                SecurityType::UnknownSecurityType,
+            )),
+        }
+    }
+}
+
+impl TextPayloadType {
+    pub fn to_proto_type(&self) -> crate::sharing_nearby::text_metadata::Type {
+        match self {
+            TextPayloadType::Url => crate::sharing_nearby::text_metadata::Type::Url,
+            TextPayloadType::Text => crate::sharing_nearby::text_metadata::Type::Text,
+            TextPayloadType::Wifi => crate::sharing_nearby::text_metadata::Type::Unknown,
         }
     }
 }

@@ -28,7 +28,7 @@ pub mod hdl;
 pub mod manager;
 pub mod utils;
 
-pub use hdl::{EndpointInfo, OutboundPayload, TransferState, Visibility};
+pub use hdl::{EndpointInfo, OutboundPayload, TextPayloadType, TransferState, Visibility};
 pub use manager::SendInfo;
 pub use utils::DeviceType;
 
