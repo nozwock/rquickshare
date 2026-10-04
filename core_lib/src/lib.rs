@@ -67,6 +67,10 @@ pub struct RQS {
     // Only used to send the info "a nearby device is sharing"
     ble_sender: broadcast::Sender<()>,
 
+    // Whether the app is in the foreground (true) or running in the background
+    // (false), see `set_foreground`.
+    foreground_sender: watch::Sender<bool>,
+
     pub port_number: Option<u32>,
 
     pub message_sender: broadcast::Sender<ChannelMessage>,
@@ -108,6 +112,9 @@ impl RQS {
         let (visibility_sender, visibility_receiver) = watch::channel(Visibility::Invisible);
         let _ = visibility_sender.send(visibility);
 
+        // Until told otherwise, the app is considered to be in the foreground
+        let (foreground_sender, _) = watch::channel(true);
+
         Self {
             tracker: None,
             ctoken: None,
@@ -115,6 +122,7 @@ impl RQS {
             visibility_sender: Arc::new(Mutex::new(visibility_sender)),
             visibility_receiver,
             ble_sender,
+            foreground_sender,
             port_number,
             message_sender,
         }
@@ -162,7 +170,8 @@ impl RQS {
                 .inspect_err(|err| warn!("BleListener: {}", err))
             {
                 let ctk = ctoken.clone();
-                tracker.spawn(async move { ble.run(ctk).await });
+                let foreground_rx = self.foreground_sender.subscribe();
+                tracker.spawn(async move { ble.run(ctk, foreground_rx).await });
             }
         }
 
@@ -230,6 +239,21 @@ impl RQS {
             .lock()
             .unwrap()
             .send_modify(|state| *state = nv);
+    }
+
+    /// Tell whether the app is in the foreground (e.g. its window is shown), or running
+    /// in the background (e.g. hidden away in the tray). The app is considered to be in
+    /// the foreground until told otherwise.
+    ///
+    /// With the `experimental` feature, the library scans for nearby devices over BLE.
+    /// On Linux/BlueZ a scan that never stops keeps other paired Bluetooth devices
+    /// (keyboards, mice) from reconnecting on their own, so while in the background
+    /// the scan is duty-cycled there: short scan windows with gaps in between.
+    /// Other platforms scan continuously regardless.
+    ///
+    /// Can be called at any time, also while the service is running.
+    pub fn set_foreground(&self, foreground: bool) {
+        self.foreground_sender.send_replace(foreground);
     }
 
     pub async fn stop(&mut self) {
