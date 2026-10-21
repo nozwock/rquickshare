@@ -13,7 +13,6 @@ use p256::{PublicKey, SecretKey};
 use rand::{Rng, RngCore};
 use sha2::Sha256;
 use tokio::io::AsyncReadExt;
-use tokio::net::TcpStream;
 
 use crate::CUSTOM_DOWNLOAD;
 
@@ -118,8 +117,8 @@ pub fn parse_mdns_endpoint_info(encoded_str: &str) -> Result<(DeviceType, String
     Ok((DeviceType::from_raw_value(device_type), device_name))
 }
 
-pub async fn stream_read_exact(
-    socket: &mut TcpStream,
+pub async fn stream_read_exact<S: tokio::io::AsyncRead + Unpin>(
+    socket: &mut S,
     buf: &mut [u8],
 ) -> Result<(), anyhow::Error> {
     match socket.read_exact(buf).await {
@@ -200,6 +199,52 @@ pub fn get_download_dir() -> PathBuf {
     }
 
     Path::new("/").to_path_buf()
+}
+
+/// Name prefixes of container, VM and VPN interfaces that a phone on the same
+/// Wi-Fi (or the phone's own hotspot) can't reach.
+const VIRTUAL_IF_PREFIXES: &[&str] = &[
+    "docker", "br-", "veth", "virbr", "vmnet", "vboxnet", "lxcbr", "lxdbr", "podman", "cni",
+    "flannel", "tun", "tap", "wg", "tailscale", "zt",
+];
+
+fn is_virtual_if(name: &str) -> bool {
+    VIRTUAL_IF_PREFIXES.iter().any(|p| name.starts_with(p))
+}
+
+/// IPv4 address of this host to advertise as our Wi-Fi-LAN endpoint in a
+/// bandwidth-upgrade. Prefers the source address of the default route, then the
+/// first private address, never one on a container/VM/VPN interface (e.g. Docker
+/// bridges, which would otherwise win when they're listed before Wi-Fi).
+pub fn local_ipv4() -> Option<[u8; 4]> {
+    let addrs: Vec<Ipv4Addr> = get_if_addrs()
+        .ok()?
+        .into_iter()
+        .filter(|ia| !ia.is_loopback() && !is_virtual_if(&ia.name))
+        .filter_map(|ia| match ia.ip() {
+            std::net::IpAddr::V4(v4) if !v4.is_link_local() => Some(v4),
+            _ => None,
+        })
+        .collect();
+
+    // Connecting a UDP socket sends nothing; it only resolves the route's source.
+    let route_src = std::net::UdpSocket::bind("0.0.0.0:0")
+        .and_then(|s| s.connect("8.8.8.8:53").map(|_| s))
+        .and_then(|s| s.local_addr())
+        .ok()
+        .and_then(|a| match a.ip() {
+            std::net::IpAddr::V4(v4) => Some(v4),
+            _ => None,
+        });
+    if let Some(v4) = route_src.filter(|v4| addrs.contains(v4)) {
+        return Some(v4.octets());
+    }
+
+    addrs
+        .iter()
+        .find(|v4| v4.is_private())
+        .or(addrs.first())
+        .map(|v4| v4.octets())
 }
 
 pub fn is_not_self_ip(ip_address: &Ipv4Addr) -> bool {

@@ -925,6 +925,14 @@ impl OutboundRequest {
                         Some(i) => i,
                         None => {
                             info!("All files have been transferred");
+                            // Send our disconnection frame, then wait for the receiver to
+                            // finish writing the payload and close the connection before we
+                            // declare the transfer Finished. If we tear the TCP socket down
+                            // the instant the last chunk is written (which a one-shot caller
+                            // does as soon as it sees Finished), the phone loses the
+                            // connection mid-finalization and reports "can't transfer files".
+                            self.disconnection().await?;
+                            self.wait_for_peer_close(Duration::from_secs(5)).await;
                             self.update_state(
                                 |e| {
                                     e.state = TransferState::Finished;
@@ -932,7 +940,6 @@ impl OutboundRequest {
                                 true,
                             )
                             .await;
-                            self.disconnection().await?;
                             // Breaking instead of NotAnError to allow peacefull termination
                             break;
                         }
@@ -1161,6 +1168,36 @@ impl OutboundRequest {
         } else {
             self.send_frame(frame.encode_to_vec()).await
         }
+    }
+
+    /// After the last payload chunk, give the receiver time to finish writing
+    /// the file and close the connection on its own. We drain (and discard) any
+    /// trailing frames it sends — its own keep-alives / disconnection — and
+    /// return as soon as the peer closes (EOF) or `grace` elapses. This prevents
+    /// a fast caller from ripping the TCP socket down before the phone has
+    /// finalized the transfer.
+    async fn wait_for_peer_close(&mut self, grace: Duration) {
+        let _ = tokio::time::timeout(grace, async {
+            let mut length_buf = [0u8; 4];
+            loop {
+                if stream_read_exact(&mut self.socket, &mut length_buf)
+                    .await
+                    .is_err()
+                {
+                    break; // peer closed the connection (EOF) — it's done
+                }
+                let len = u32::from_be_bytes(length_buf) as usize;
+                if len == 0 || len > SANE_FRAME_LENGTH as usize {
+                    continue;
+                }
+                let mut body = vec![0u8; len];
+                if stream_read_exact(&mut self.socket, &mut body).await.is_err() {
+                    break;
+                }
+                // Discard; keep draining until the peer closes or grace elapses.
+            }
+        })
+        .await;
     }
 
     async fn finalize_key_exchange(

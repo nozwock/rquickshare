@@ -13,7 +13,7 @@ use p256::{EncodedPoint, PublicKey};
 use prost::Message;
 use rand::Rng;
 use sha2::{Digest, Sha256, Sha512};
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::broadcast::{Receiver, Sender};
 
@@ -47,16 +47,112 @@ type HmacSha256 = Hmac<Sha256>;
 const SANE_FRAME_LENGTH: i32 = 5 * 1024 * 1024;
 const SANITY_DURATION: Duration = Duration::from_micros(10);
 
+#[cfg(test)]
+mod dest_name_tests {
+    use super::dest_file_name;
+
+    #[test]
+    fn fixes_generic_extension_from_mime() {
+        // The observed case: a PDF sent as a .tmp cache file.
+        assert_eq!(dest_file_name("cache123.tmp", "application/pdf"), "cache123.pdf");
+        // No extension + a known MIME type → gains the right one.
+        assert!(dest_file_name("noext", "application/pdf").ends_with(".pdf"));
+        // A good, specific extension is left alone.
+        assert_eq!(dest_file_name("photo.jpg", "image/jpeg"), "photo.jpg");
+        assert_eq!(dest_file_name("real.pdf", "application/pdf"), "real.pdf");
+        // Unknown/default MIME type → keep the sender's name untouched.
+        assert_eq!(dest_file_name("data.tmp", "application/octet-stream"), "data.tmp");
+    }
+}
+
+/// Pick the on-disk name for a received file: keep the sender's name, but if its
+/// extension is missing or generic (e.g. a `.tmp` cache file), fix it from the
+/// declared MIME type so e.g. a PDF sent as `cache123.tmp` lands as `cache123.pdf`.
+fn dest_file_name(name: &str, mime_type: &str) -> String {
+    let path = std::path::Path::new(name);
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase());
+    let generic = matches!(ext.as_deref(), None | Some("tmp") | Some("bin") | Some("dat"));
+    if !generic || mime_type.is_empty() || mime_type == "application/octet-stream" {
+        return name.to_string();
+    }
+    match mime_guess::get_mime_extensions_str(mime_type).and_then(|exts| exts.first()) {
+        Some(good) => path.with_extension(good).to_string_lossy().into_owned(),
+        None => name.to_string(),
+    }
+}
+
+/// If `buf` begins with a complete `[len][OfflineFrame]` that is a bandwidth-upgrade
+/// CLIENT_INTRODUCTION, returns the peer's endpoint_id. Used by the TCP server to
+/// route an upgraded connection to its in-flight BLE session instead of treating it
+/// as a fresh transfer. Returns None if not (yet) a client introduction.
+pub fn peek_client_introduction(buf: &[u8]) -> Option<String> {
+    use location_nearby_connections::bandwidth_upgrade_negotiation_frame::EventType;
+    if buf.len() < 4 {
+        return None;
+    }
+    let len = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
+    if len == 0 || buf.len() < 4 + len {
+        return None;
+    }
+    let frame = OfflineFrame::decode(&buf[4..4 + len]).ok()?;
+    let v1 = frame.v1?;
+    if v1.r#type() != location_nearby_connections::v1_frame::FrameType::BandwidthUpgradeNegotiation {
+        return None;
+    }
+    let bwu = v1.bandwidth_upgrade_negotiation?;
+    if bwu.event_type() != EventType::ClientIntroduction {
+        return None;
+    }
+    Some(bwu.client_introduction?.endpoint_id().to_string())
+}
+
+/// Read one length-prefixed `[4-byte len][frame]` message from a stream (plaintext).
+#[cfg(all(feature = "experimental", target_os = "linux"))]
+async fn read_frame_from<R: AsyncRead + Unpin>(stream: &mut R) -> Result<Vec<u8>, anyhow::Error> {
+    let mut len_buf = [0u8; 4];
+    stream_read_exact(stream, &mut len_buf).await?;
+    let len = u32::from_be_bytes(len_buf) as usize;
+    if len == 0 || len > SANE_FRAME_LENGTH as usize {
+        return Err(anyhow!("bad frame length {len}"));
+    }
+    let mut data = vec![0u8; len];
+    stream_read_exact(stream, &mut data).await?;
+    Ok(data)
+}
+
+/// Write a length-prefixed `[4-byte len][frame]` message to a stream (plaintext).
+#[cfg(all(feature = "experimental", target_os = "linux"))]
+async fn send_frame_on<W: AsyncWrite + Unpin>(
+    stream: &mut W,
+    data: &[u8],
+) -> Result<(), anyhow::Error> {
+    let mut buf = Vec::with_capacity(4 + data.len());
+    buf.extend_from_slice(&(data.len() as u32).to_be_bytes());
+    buf.extend_from_slice(data);
+    stream.write_all(&buf).await?;
+    stream.flush().await?;
+    Ok(())
+}
+
 #[derive(Debug)]
-pub struct InboundRequest {
-    socket: TcpStream,
+pub struct InboundRequest<S = TcpStream> {
+    socket: S,
     pub state: InnerState,
     sender: Sender<ChannelMessage>,
     receiver: Receiver<ChannelMessage>,
+    /// Set (BLE sessions) to enable offering a Wi-Fi bandwidth upgrade once the
+    /// encrypted connection is established.
+    bwu_tcp_port: Option<u16>,
+    /// Set by the state machine when it's time to run the bandwidth-upgrade
+    /// handoff; consumed by the BLE session loop (which owns a MigratableStream).
+    bwu_pending: bool,
 }
 
-impl InboundRequest {
-    pub fn new(socket: TcpStream, id: String, sender: Sender<ChannelMessage>) -> Self {
+impl<S: AsyncRead + AsyncWrite + Unpin> InboundRequest<S> {
+    pub fn new(socket: S, id: String, sender: Sender<ChannelMessage>) -> Self {
         let receiver = sender.subscribe();
 
         Self {
@@ -71,7 +167,144 @@ impl InboundRequest {
             },
             sender,
             receiver,
+            bwu_tcp_port: None,
+            bwu_pending: false,
         }
+    }
+
+    /// Enable Wi-Fi bandwidth upgrade for this (BLE) session.
+    pub fn set_bwu_tcp_port(&mut self, port: u16) {
+        self.bwu_tcp_port = Some(port);
+    }
+
+    /// Consume the "run the bandwidth upgrade now" flag.
+    pub fn take_bwu_pending(&mut self) -> bool {
+        std::mem::take(&mut self.bwu_pending)
+    }
+
+    /// Build a BANDWIDTH_UPGRADE_NEGOTIATION OfflineFrame for the given event.
+    fn bwu_frame(
+        event_type: location_nearby_connections::bandwidth_upgrade_negotiation_frame::EventType,
+        upgrade_path_info: Option<
+            location_nearby_connections::bandwidth_upgrade_negotiation_frame::UpgradePathInfo,
+        >,
+        client_introduction: Option<
+            location_nearby_connections::bandwidth_upgrade_negotiation_frame::ClientIntroduction,
+        >,
+    ) -> OfflineFrame {
+        use location_nearby_connections::BandwidthUpgradeNegotiationFrame;
+        OfflineFrame {
+            version: Some(location_nearby_connections::offline_frame::Version::V1.into()),
+            v1: Some(location_nearby_connections::V1Frame {
+                r#type: Some(
+                    location_nearby_connections::v1_frame::FrameType::BandwidthUpgradeNegotiation
+                        .into(),
+                ),
+                bandwidth_upgrade_negotiation: Some(BandwidthUpgradeNegotiationFrame {
+                    event_type: Some(event_type.into()),
+                    upgrade_path_info,
+                    client_introduction,
+                    client_introduction_ack: None,
+                }),
+                ..Default::default()
+            }),
+        }
+    }
+
+    /// Offer a Wi-Fi-LAN bandwidth upgrade: send an encrypted UPGRADE_PATH_AVAILABLE
+    /// over the current (BLE) channel advertising our TCP ip:port.
+    async fn send_upgrade_path_available(&mut self, port: u16) -> Result<(), anyhow::Error> {
+        use location_nearby_connections::bandwidth_upgrade_negotiation_frame::{
+            EventType, UpgradePathInfo,
+            upgrade_path_info::{Medium, WifiLanSocket},
+        };
+
+        let ip = crate::utils::local_ipv4()
+            .ok_or_else(|| anyhow!("no local IPv4 address for bandwidth upgrade"))?;
+        info!(
+            "BWU: offering WIFI_LAN upgrade at {}.{}.{}.{}:{port}",
+            ip[0], ip[1], ip[2], ip[3]
+        );
+
+        let frame = Self::bwu_frame(
+            EventType::UpgradePathAvailable,
+            Some(UpgradePathInfo {
+                medium: Some(Medium::WifiLan.into()),
+                wifi_lan_socket: Some(WifiLanSocket {
+                    ip_address: Some(ip.to_vec()),
+                    wifi_port: Some(port as i32),
+                }),
+                supports_client_introduction_ack: Some(true),
+                ..Default::default()
+            }),
+            None,
+        );
+        self.encrypt_and_send(&frame).await
+    }
+
+    /// Build a plaintext CLIENT_INTRODUCTION_ACK (sent over the new TCP channel).
+    fn bwu_ack_frame() -> OfflineFrame {
+        use location_nearby_connections::BandwidthUpgradeNegotiationFrame;
+        use location_nearby_connections::bandwidth_upgrade_negotiation_frame::{
+            ClientIntroductionAck, EventType,
+        };
+        OfflineFrame {
+            version: Some(location_nearby_connections::offline_frame::Version::V1.into()),
+            v1: Some(location_nearby_connections::V1Frame {
+                r#type: Some(
+                    location_nearby_connections::v1_frame::FrameType::BandwidthUpgradeNegotiation
+                        .into(),
+                ),
+                bandwidth_upgrade_negotiation: Some(BandwidthUpgradeNegotiationFrame {
+                    event_type: Some(EventType::ClientIntroductionAck.into()),
+                    client_introduction_ack: Some(ClientIntroductionAck {}),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+        }
+    }
+
+    /// Read one encrypted frame from the current channel and return the decrypted
+    /// OfflineFrame (advancing client_seq). Used to drain the BLE channel during a
+    /// bandwidth upgrade without dispatching to the payload state machine.
+    async fn read_encrypted_offline_frame(&mut self) -> Result<OfflineFrame, anyhow::Error> {
+        let mut len_buf = [0u8; 4];
+        stream_read_exact(&mut self.socket, &mut len_buf).await?;
+        let msg_len = u32::from_be_bytes(len_buf) as usize;
+        if msg_len == 0 || msg_len > SANE_FRAME_LENGTH as usize {
+            return Err(anyhow!("bad frame length {msg_len}"));
+        }
+        let mut data = vec![0u8; msg_len];
+        stream_read_exact(&mut self.socket, &mut data).await?;
+
+        let smsg = SecureMessage::decode(&*data)?;
+        let mut hmac = HmacSha256::new_from_slice(self.state.recv_hmac_key.as_ref().unwrap())?;
+        hmac.update(&smsg.header_and_body);
+        if !hmac
+            .finalize()
+            .into_bytes()
+            .as_slice()
+            .eq(smsg.signature.as_slice())
+        {
+            return Err(anyhow!("hmac!=signature"));
+        }
+        let header_and_body = HeaderAndBody::decode(&*smsg.header_and_body)?;
+        let key = self.state.decrypt_key.as_ref().unwrap();
+        let mut cipher = Cipher::new_256(key[..AES_256_KEY_LEN].try_into()?);
+        cipher.set_auto_padding(true);
+        let decrypted = cipher.cbc_decrypt(header_and_body.header.iv(), &header_and_body.body);
+        let d2d_msg = DeviceToDeviceMessage::decode(&*decrypted)?;
+
+        let seq = self.get_client_seq_inc().await;
+        if d2d_msg.sequence_number() != seq {
+            return Err(anyhow!(
+                "seq invalid ({} vs {})",
+                d2d_msg.sequence_number(),
+                seq
+            ));
+        }
+        Ok(OfflineFrame::decode(d2d_msg.message())?)
     }
 
     pub async fn handle(&mut self) -> Result<(), anyhow::Error> {
@@ -204,6 +437,12 @@ impl InboundRequest {
                     false,
                 )
                 .await;
+
+                // The encrypted connection is up: flag a Wi-Fi bandwidth upgrade
+                // (BLE sessions only). The BLE session loop runs the handoff.
+                if self.bwu_tcp_port.is_some() {
+                    self.bwu_pending = true;
+                }
             }
             _ => {
                 debug!("Handling SecureMessage frame");
@@ -498,6 +737,16 @@ impl InboundRequest {
         }
 
         let offline = location_nearby_connections::OfflineFrame::decode(d2d_msg.message())?;
+        self.process_offline_frame(offline).await
+    }
+
+    /// Dispatch a decrypted OfflineFrame (payload transfers, keep-alives, …).
+    /// Factored out so the bandwidth-upgrade drain can process non-BWU frames the
+    /// phone keeps sending over BLE while the upgrade completes.
+    async fn process_offline_frame(
+        &mut self,
+        offline: OfflineFrame,
+    ) -> Result<(), anyhow::Error> {
         let v1_frame = offline
             .v1
             .as_ref()
@@ -763,6 +1012,12 @@ impl InboundRequest {
             .as_ref()
             .ok_or_else(|| anyhow!("Missing required fields"))?;
 
+        debug!(
+            "process_transfer_setup: state={:?} inner frame type={:?}",
+            self.state.state,
+            v1_frame.r#type()
+        );
+
         if v1_frame.r#type() == sharing_nearby::v1_frame::FrameType::Cancel {
             info!("Transfer canceled");
             self.update_state(
@@ -801,7 +1056,16 @@ impl InboundRequest {
             }
             TransferState::ReceivedPairedKeyResult => {
                 debug!("Processing State::ReceivedPairedKeyResult");
-                self.process_introduction(v1_frame).await?;
+                // Newer senders (Pixel) may interleave extra frames before the
+                // introduction; wait for the actual introduction instead of erroring.
+                if v1_frame.introduction.is_some() {
+                    self.process_introduction(v1_frame).await?;
+                } else {
+                    debug!(
+                        "Awaiting introduction; ignoring frame type={:?}",
+                        v1_frame.r#type()
+                    );
+                }
             }
             _ => {
                 info!(
@@ -873,10 +1137,11 @@ impl InboundRequest {
             let mut total_bytes: u64 = 0;
 
             for file in &introduction.file_metadata {
-                info!("File name: {}", file.name());
+                let resolved_name = dest_file_name(file.name(), file.mime_type());
+                info!("File name: {} (as {})", file.name(), resolved_name);
 
                 let mut dest = get_download_dir();
-                dest.push(file.name());
+                dest.push(&resolved_name);
 
                 info!("Destination: {:?}", dest);
                 if dest.exists() {
@@ -889,7 +1154,7 @@ impl InboundRequest {
                         // lorem (1).txt
                         // ...
                         let incremented_file_path = {
-                            let file_path = PathBuf::from(file.name());
+                            let file_path = PathBuf::from(&resolved_name);
 
                             let incremented_file_stem = format!(
                                 "{} ({counter})",
@@ -928,7 +1193,7 @@ impl InboundRequest {
                 };
                 total_bytes += info.total_size as u64;
                 self.state.transferred_files.insert(file.payload_id(), info);
-                files_name.push(file.name().to_owned());
+                files_name.push(resolved_name.clone());
             }
 
             let metadata = TransferMetadata {
@@ -1414,5 +1679,119 @@ impl InboundRequest {
         // some spare time to process channel's message. Otherwise it
         // get spammed by new requests. Currently set to 10 micro secs.
         tokio::time::sleep(SANITY_DURATION).await;
+    }
+}
+
+#[cfg(all(feature = "experimental", target_os = "linux"))]
+impl InboundRequest<crate::hdl::MigratableStream> {
+    /// Run the Wi-Fi bandwidth upgrade: offer a TCP path over the (encrypted) BLE
+    /// channel, accept the phone, exchange the plaintext CLIENT_INTRODUCTION/ACK,
+    /// drain the BLE channel, then swap the socket to TCP so the (large) payload
+    /// streams over Wi-Fi with the same keys/sequence numbers. On failure the
+    /// session stays on BLE — never worse than BLE-only.
+    pub async fn do_bwu(&mut self) -> Result<(), anyhow::Error> {
+        use location_nearby_connections::bandwidth_upgrade_negotiation_frame::EventType;
+
+        let listener = tokio::net::TcpListener::bind("0.0.0.0:0").await?;
+        let port = listener.local_addr()?.port();
+
+        // Offer WIFI_LAN over the encrypted BLE channel.
+        self.send_upgrade_path_available(port).await?;
+
+        // Wait for the phone to connect over TCP; if it doesn't, stay on BLE.
+        let mut tcp = match tokio::time::timeout(Duration::from_secs(15), listener.accept()).await {
+            Ok(Ok((s, peer))) => {
+                info!("BWU: phone connected over TCP from {peer}");
+                s
+            }
+            _ => {
+                warn!("BWU: no TCP upgrade within timeout; staying on BLE");
+                return Ok(());
+            }
+        };
+
+        // Plaintext CLIENT_INTRODUCTION → CLIENT_INTRODUCTION_ACK on the new socket.
+        // Bounded, so a stalled phone can't hold up the session (and its UI
+        // accept/decline actions) indefinitely.
+        let intro = tokio::time::timeout(Duration::from_secs(10), read_frame_from(&mut tcp))
+            .await
+            .map_err(|_| anyhow!("BWU: no CLIENT_INTRODUCTION within timeout"))??;
+        if let Ok(f) = OfflineFrame::decode(&*intro) {
+            debug!("BWU: TCP intro frame type={:?}", f.v1.as_ref().map(|v| v.r#type()));
+        }
+        send_frame_on(&mut tcp, &Self::bwu_ack_frame().encode_to_vec()).await?;
+
+        // Drain the BLE channel: our LAST_WRITE, then read the peer's control frames
+        // (advancing client_seq) until it's safe to close the prior channel.
+        self.encrypt_and_send(&Self::bwu_frame(EventType::LastWriteToPriorChannel, None, None))
+            .await?;
+        for _ in 0..16 {
+            let offline = match tokio::time::timeout(
+                Duration::from_secs(5),
+                self.read_encrypted_offline_frame(),
+            )
+            .await
+            {
+                Ok(Ok(f)) => f,
+                _ => break,
+            };
+            let frame_type = offline.v1.as_ref().map(|v| v.r#type());
+            if frame_type
+                != Some(location_nearby_connections::v1_frame::FrameType::BandwidthUpgradeNegotiation)
+            {
+                // The phone keeps sending normal frames (paired-key, etc.) over BLE
+                // until its LAST_WRITE — process them so the sharing handshake
+                // continues correctly after the swap.
+                if let Err(e) = self.process_offline_frame(offline).await {
+                    debug!("BWU drain: error processing non-BWU frame: {e}");
+                }
+                continue;
+            }
+            let event = offline
+                .v1
+                .as_ref()
+                .and_then(|v| v.bandwidth_upgrade_negotiation.as_ref())
+                .map(|b| b.event_type());
+            match event {
+                Some(EventType::LastWriteToPriorChannel) => {
+                    debug!("BWU drain: peer LAST_WRITE → sending SAFE_TO_CLOSE");
+                    let _ = self
+                        .encrypt_and_send(&Self::bwu_frame(
+                            EventType::SafeToClosePriorChannel,
+                            None,
+                            None,
+                        ))
+                        .await;
+                }
+                Some(EventType::SafeToClosePriorChannel) => {
+                    debug!("BWU drain: peer SAFE_TO_CLOSE → done");
+                    break;
+                }
+                other => debug!("BWU drain: event {other:?}"),
+            }
+        }
+
+        // Tell the phone the prior (BLE) channel is closing so it stops pausing the
+        // new channel and resumes immediately (avoids a ~10s phone-side timeout).
+        // Sent plaintext (unencrypted) per the protocol, and given a moment to flush
+        // through the weave bridge before we drop the BLE side.
+        let disc = OfflineFrame {
+            version: Some(location_nearby_connections::offline_frame::Version::V1.into()),
+            v1: Some(location_nearby_connections::V1Frame {
+                r#type: Some(location_nearby_connections::v1_frame::FrameType::Disconnection.into()),
+                disconnection: Some(location_nearby_connections::DisconnectionFrame {
+                    request_safe_to_disconnect: Some(false),
+                    ack_safe_to_disconnect: Some(false),
+                }),
+                ..Default::default()
+            }),
+        };
+        let _ = self.send_frame(disc.encode_to_vec()).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        // Swap to the TCP channel; the payload loop resumes over Wi-Fi.
+        self.socket = crate::hdl::MigratableStream::Tcp(tcp);
+        info!("BWU: upgraded to Wi-Fi-LAN; payload continues over TCP");
+        Ok(())
     }
 }

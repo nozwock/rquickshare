@@ -65,6 +65,18 @@ impl TcpServer {
                             let csender = self.sender.clone();
 
                             tokio::spawn(async move {
+                                // Detect a Wi-Fi bandwidth-upgrade CLIENT_INTRODUCTION so it can be
+                                // routed to its in-flight BLE session (Milestone A: observe only).
+                                #[cfg(all(feature = "experimental", target_os = "linux"))]
+                                {
+                                    let mut pbuf = [0u8; 512];
+                                    if let Ok(n) = socket.peek(&mut pbuf).await {
+                                        if let Some(eid) = crate::hdl::peek_client_introduction(&pbuf[..n]) {
+                                            info!("{INNER_NAME}: BWU CLIENT_INTRODUCTION from {remote_addr} (endpoint_id={eid}) — routing TODO");
+                                            return;
+                                        }
+                                    }
+                                }
                                 let mut ir = InboundRequest::new(socket, remote_addr.to_string(), csender);
 
                                 loop {

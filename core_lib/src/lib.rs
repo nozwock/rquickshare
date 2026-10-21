@@ -177,6 +177,91 @@ impl RQS {
         let ctk = ctoken.clone();
         tracker.spawn(async move { mdns.run(ctk).await });
 
+        // Advertise as a discoverable QuickShare receiver over BLE (0xFEF3) so a
+        // phone that drops off Wi-Fi during its browse phase (the Pixel "AirDrop
+        // update" behaviour) can still list us as a target. Uses the SAME
+        // endpoint_id as mDNS, so once selected the phone reconnects to Wi-Fi and
+        // completes the transfer over the normal Wi-Fi-LAN (mDNS + TCP) path.
+        // The advertisement follows the visibility setting (hidden => not
+        // discoverable over BLE either); the GATT server stays registered.
+        #[cfg(all(feature = "experimental", target_os = "linux"))]
+        {
+            let rx_endpoint_id: [u8; 4] = endpoint_id[..4].try_into()?;
+            let rx_device_name = DEVICE_NAME.read().unwrap().clone();
+            // Same advertisement bytes are used for the BLE advert and served
+            // over GATT slot 0, so the phone reads a consistent endpoint.
+            let advert = crate::hdl::receiver_service_data(
+                rx_endpoint_id,
+                crate::utils::DeviceType::Laptop as u8,
+                &rx_device_name,
+            );
+
+            // GATT server: when the phone selects us it opens a GATT connection,
+            // reads slot 0 for our advertisement, then drives the weave data
+            // socket which we bridge to the inbound handshake.
+            let gatt_advert = advert.clone();
+            let gatt_sender = self.message_sender.clone();
+            let gatt_tcp_port = binded_addr.port();
+            let gctk = ctoken.clone();
+            tracker.spawn(async move {
+                match crate::hdl::ReceiverGattServer::new(gatt_advert, gatt_sender, gatt_tcp_port).await {
+                    Ok(srv) => {
+                        if let Err(e) = srv.run(gctk).await {
+                            error!("ReceiverGattServer: {}", e);
+                        }
+                    }
+                    Err(e) => error!("Couldn't init ReceiverGattServer: {}", e),
+                }
+            });
+
+            // BLE receiver advertisement (0xFEF3), only while visible.
+            let ctk = ctoken.clone();
+            let mut visibility = self.visibility_receiver.clone();
+            tracker.spawn(async move {
+                let adv = match crate::hdl::ReceiverAdvertiser::new(
+                    rx_endpoint_id,
+                    crate::utils::DeviceType::Laptop as u8,
+                    &rx_device_name,
+                )
+                .await
+                {
+                    Ok(adv) => adv,
+                    Err(e) => {
+                        error!("Couldn't init ReceiverAdvertiser: {}", e);
+                        return;
+                    }
+                };
+
+                loop {
+                    tokio::select! {
+                        _ = ctk.cancelled() => return,
+                        r = visibility.wait_for(|v| *v != Visibility::Invisible) => {
+                            if r.is_err() {
+                                return;
+                            }
+                        }
+                    }
+
+                    // Dropping run() drops its advertisement handle, which
+                    // unregisters the advertisement.
+                    tokio::select! {
+                        res = adv.run(ctk.clone()) => {
+                            if let Err(e) = res {
+                                error!("ReceiverAdvertiser: {}", e);
+                            }
+                            return;
+                        }
+                        r = visibility.wait_for(|v| *v == Visibility::Invisible) => {
+                            if r.is_err() {
+                                return;
+                            }
+                            info!("ReceiverAdvertiser: hidden, stopped advertising");
+                        }
+                    }
+                }
+            });
+        }
+
         tracker.close();
 
         Ok((send_channel.0, self.ble_sender.subscribe()))
