@@ -13,17 +13,25 @@ use p256::{EncodedPoint, PublicKey};
 use prost::Message;
 use rand::Rng;
 use sha2::{Digest, Sha256, Sha512};
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncWriteExt, WriteHalf};
 use tokio::sync::broadcast::{Receiver, Sender};
+use tokio::sync::{mpsc, oneshot};
 
+use super::bwu::{self, FrameReader, Hotspot, Incoming, TaskGuard, Upgraded};
 use super::{InnerState, TransferState, Transport};
 use crate::channel::{self, ChannelMessage, MessageClient, TransferAction, TransferKind};
 use crate::hdl::TextPayloadInfo;
 use crate::hdl::info::{InternalFileInfo, TransferMetadata, TransferPayload, TransferPayloadKind};
+use crate::location_nearby_connections::bandwidth_upgrade_negotiation_frame::EventType as BwuEvent;
+use crate::location_nearby_connections::bandwidth_upgrade_negotiation_frame::upgrade_path_info::Medium;
+use crate::location_nearby_connections::connection_request_frame::Medium as RequestMedium;
 use crate::location_nearby_connections::payload_transfer_frame::{
     PacketType, PayloadChunk, PayloadHeader, payload_header,
 };
-use crate::location_nearby_connections::{KeepAliveFrame, OfflineFrame, PayloadTransferFrame};
+use crate::location_nearby_connections::{
+    BandwidthUpgradeNegotiationFrame, KeepAliveFrame, MediumMetadata, OfflineFrame,
+    PayloadTransferFrame,
+};
 use crate::securegcm::ukey2_alert::AlertType;
 use crate::securegcm::{
     DeviceToDeviceMessage, GcmMetadata, Type, Ukey2Alert, Ukey2ClientFinished, Ukey2ClientInit,
@@ -37,7 +45,7 @@ use crate::sharing_nearby::wifi_credentials_metadata::SecurityType;
 use crate::sharing_nearby::{paired_key_result_frame, text_metadata};
 use crate::utils::{
     DeviceType, RemoteDeviceInfo, encode_point, gen_ecdsa_keypair, gen_random, get_download_dir,
-    hkdf_extract_expand, stream_read_exact, to_four_digit_string,
+    hkdf_extract_expand, to_four_digit_string,
 };
 use crate::{location_nearby_connections, sharing_nearby};
 
@@ -48,18 +56,92 @@ const SANITY_DURATION: Duration = Duration::from_micros(10);
 
 #[derive(Debug)]
 pub struct InboundRequest {
-    socket: Transport,
+    /// Write side of the current channel; its read side feeds `frames`.
+    writer: WriteHalf<Transport>,
+    medium: Medium,
+    frames: mpsc::UnboundedReceiver<Incoming>,
+    frames_tx: mpsc::UnboundedSender<Incoming>,
+    reader: FrameReader,
+    generation: u32,
+    /// Frames are plain offline frames (after an upgrade that disabled
+    /// encryption).
+    plaintext: bool,
+    upgrade: Upgrade,
+    /// What the sender said it can upgrade to.
+    sender_mediums: Vec<RequestMedium>,
+    sender_metadata: Option<MediumMetadata>,
     pub state: InnerState,
     sender: Sender<ChannelMessage>,
     receiver: Receiver<ChannelMessage>,
 }
 
+/// Progress of a bandwidth upgrade we initiate (see [`bwu`]): as the
+/// receiver we host a hotspot and the sender moves to it.
+#[derive(Debug, Default)]
+enum Upgrade {
+    #[default]
+    None,
+    Hosting {
+        hotspot: oneshot::Receiver<Result<Hotspot, anyhow::Error>>,
+        _task: TaskGuard,
+    },
+    /// The sender knows the hotspot; waiting for it to connect.
+    Waiting {
+        accepted: oneshot::Receiver<Result<Upgraded, anyhow::Error>>,
+        _task: TaskGuard,
+        /// The sender already sent its last write on the old channel.
+        peer_last_write: bool,
+    },
+    /// We sent our last write on the old channel and must not write until
+    /// the sender says it is safe to close it.
+    Switching {
+        new: Upgraded,
+    },
+    Done {
+        _wifi: bwu::WifiConnection,
+    },
+    Failed,
+}
+
+enum UpgradeProgress {
+    Hosted(Result<Hotspot, anyhow::Error>),
+    Accepted(Result<Upgraded, anyhow::Error>),
+}
+
+/// Resolves when the upgrade task currently running finishes.
+async fn upgrade_progress(upgrade: &mut Upgrade) -> UpgradeProgress {
+    let died = || anyhow!("upgrade task died");
+    match upgrade {
+        Upgrade::Hosting { hotspot, .. } => {
+            UpgradeProgress::Hosted(hotspot.await.unwrap_or_else(|_| Err(died())))
+        }
+        Upgrade::Waiting { accepted, .. } => {
+            UpgradeProgress::Accepted(accepted.await.unwrap_or_else(|_| Err(died())))
+        }
+        _ => std::future::pending().await,
+    }
+}
+
 impl InboundRequest {
     pub fn new(socket: impl Into<Transport>, id: String, sender: Sender<ChannelMessage>) -> Self {
         let receiver = sender.subscribe();
+        let socket = socket.into();
+        let medium = socket.medium();
+        let (read, writer) = tokio::io::split(socket);
+        let (frames_tx, frames) = mpsc::unbounded_channel();
+        let reader = FrameReader::spawn(read, 0, frames_tx.clone());
 
         Self {
-            socket: socket.into(),
+            writer,
+            medium,
+            frames,
+            frames_tx,
+            reader,
+            generation: 0,
+            plaintext: false,
+            upgrade: Upgrade::None,
+            sender_mediums: Vec::new(),
+            sender_metadata: None,
             state: InnerState {
                 id,
                 server_seq: 0,
@@ -74,9 +156,6 @@ impl InboundRequest {
     }
 
     pub async fn handle(&mut self) -> Result<(), anyhow::Error> {
-        // Buffer for the 4-byte length
-        let mut length_buf = [0u8; 4];
-
         tokio::select! {
             i = self.receiver.recv() => {
                 match i {
@@ -123,28 +202,24 @@ impl InboundRequest {
                     }
                 }
             },
-            h = stream_read_exact(&mut self.socket, &mut length_buf) => {
-                h?;
-
-                self._handle(length_buf).await?
+            incoming = self.frames.recv() => {
+                let Some(incoming) = incoming else {
+                    return Err(anyhow!("frame reader stopped"));
+                };
+                if incoming.generation == self.generation {
+                    let frame = incoming.frame.map_err(|e| anyhow!(e))?;
+                    self._handle(frame).await?
+                }
+            }
+            progress = upgrade_progress(&mut self.upgrade) => {
+                self.on_upgrade_progress(progress).await?;
             }
         }
 
         Ok(())
     }
 
-    pub async fn _handle(&mut self, length_buf: [u8; 4]) -> Result<(), anyhow::Error> {
-        let msg_length = u32::from_be_bytes(length_buf) as usize;
-        // Ensure the message length is not unreasonably big to avoid allocation attacks
-        if msg_length > SANE_FRAME_LENGTH as usize {
-            error!("Message length too big");
-            return Err(anyhow!("value"));
-        }
-
-        // Allocate buffer for the actual message and read it
-        let mut frame_data = vec![0u8; msg_length];
-        stream_read_exact(&mut self.socket, &mut frame_data).await?;
-
+    pub async fn _handle(&mut self, frame_data: Vec<u8>) -> Result<(), anyhow::Error> {
         let current_state = &self.state;
         // Now determine what will be the request type based on current state
         match current_state.state {
@@ -153,6 +228,14 @@ impl InboundRequest {
                 let frame = location_nearby_connections::OfflineFrame::decode(&*frame_data)?;
                 let rdi = self.process_connection_request(&frame)?;
                 info!("RemoteDeviceInfo: {:?}", &rdi);
+                if let Some(request) = frame
+                    .v1
+                    .as_ref()
+                    .and_then(|v1| v1.connection_request.as_ref())
+                {
+                    self.sender_mediums = request.mediums().collect();
+                    self.sender_metadata = request.medium_metadata.clone();
+                }
 
                 // Advance current state
                 self.update_state(
@@ -206,8 +289,7 @@ impl InboundRequest {
             }
             _ => {
                 debug!("Handling SecureMessage frame");
-                let smsg = SecureMessage::decode(&*frame_data)?;
-                self.decrypt_and_process_secure_message(&smsg).await?;
+                self.decrypt_and_process_secure_message(&frame_data).await?;
             }
         }
 
@@ -469,8 +551,42 @@ impl InboundRequest {
 
     async fn decrypt_and_process_secure_message(
         &mut self,
-        smsg: &SecureMessage,
+        data: &[u8],
     ) -> Result<(), anyhow::Error> {
+        let offline = if self.plaintext {
+            OfflineFrame::decode(data)?
+        } else {
+            self.decrypt(&SecureMessage::decode(data)?).await?
+        };
+        let v1_frame = offline
+            .v1
+            .as_ref()
+            .ok_or_else(|| anyhow!("Missing required fields"))?;
+        match v1_frame.r#type() {
+            location_nearby_connections::v1_frame::FrameType::PayloadTransfer => {
+                self.process_payload_transfer(v1_frame).await?;
+            }
+            location_nearby_connections::v1_frame::FrameType::BandwidthUpgradeNegotiation => {
+                if let Some(bwu) = &v1_frame.bandwidth_upgrade_negotiation {
+                    self.on_bwu_frame(bwu).await?;
+                }
+            }
+            location_nearby_connections::v1_frame::FrameType::KeepAlive => {
+                trace!("Sending keepalive");
+                self.send_keepalive(true).await?;
+            }
+            location_nearby_connections::v1_frame::FrameType::Disconnection => {
+                debug!("Sender disconnected");
+            }
+            _ => {
+                error!("Unhandled offline frame encrypted: {:?}", offline);
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn decrypt(&mut self, smsg: &SecureMessage) -> Result<OfflineFrame, anyhow::Error> {
         let mut hmac = HmacSha256::new_from_slice(self.state.recv_hmac_key.as_ref().unwrap())?;
         hmac.update(&smsg.header_and_body);
         if !hmac
@@ -502,13 +618,17 @@ impl InboundRequest {
             ));
         }
 
-        let offline = location_nearby_connections::OfflineFrame::decode(d2d_msg.message())?;
-        let v1_frame = offline
-            .v1
-            .as_ref()
-            .ok_or_else(|| anyhow!("Missing required fields"))?;
-        match v1_frame.r#type() {
-            location_nearby_connections::v1_frame::FrameType::PayloadTransfer => {
+        Ok(location_nearby_connections::OfflineFrame::decode(
+            d2d_msg.message(),
+        )?)
+    }
+
+    async fn process_payload_transfer(
+        &mut self,
+        v1_frame: &location_nearby_connections::V1Frame,
+    ) -> Result<(), anyhow::Error> {
+        {
+            {
                 trace!("Received FrameType::PayloadTransfer");
                 let payload_transfer = v1_frame
                     .payload_transfer
@@ -746,19 +866,6 @@ impl InboundRequest {
                         )
                     }
                 }
-            }
-            location_nearby_connections::v1_frame::FrameType::BandwidthUpgradeNegotiation => {
-                info!(
-                    "Bandwidth upgrade negotiation: {:?}",
-                    v1_frame.bandwidth_upgrade_negotiation
-                );
-            }
-            location_nearby_connections::v1_frame::FrameType::KeepAlive => {
-                trace!("Sending keepalive");
-                self.send_keepalive(true).await?;
-            }
-            _ => {
-                error!("Unhandled offline frame encrypted: {:?}", offline);
             }
         }
 
@@ -1111,7 +1218,126 @@ impl InboundRequest {
         )
         .await;
 
+        self.start_upgrade();
         Ok(())
+    }
+
+    /// Like Android, offers a faster medium once the transfer is accepted.
+    /// Hosting a hotspot takes over the Wi-Fi adapter for the transfer, so
+    /// only do it to get off Bluetooth.
+    fn start_upgrade(&mut self) {
+        if self.medium != Medium::Bluetooth
+            || !matches!(self.upgrade, Upgrade::None)
+            || !self.sender_mediums.contains(&RequestMedium::WifiHotspot)
+        {
+            return;
+        }
+        let (tx, hotspot) = oneshot::channel();
+        let metadata = self.sender_metadata.clone();
+        let task = TaskGuard(tokio::spawn(async move {
+            let _ = tx.send(Hotspot::start(metadata.as_ref()).await);
+        }));
+        self.upgrade = Upgrade::Hosting {
+            hotspot,
+            _task: task,
+        };
+    }
+
+    async fn on_upgrade_progress(
+        &mut self,
+        progress: UpgradeProgress,
+    ) -> Result<(), anyhow::Error> {
+        let peer_last_write = matches!(
+            self.upgrade,
+            Upgrade::Waiting {
+                peer_last_write: true,
+                ..
+            }
+        );
+        self.upgrade = Upgrade::Failed;
+        match progress {
+            UpgradeProgress::Hosted(Ok(hotspot)) => {
+                let available = bwu::negotiation(BwuEvent::UpgradePathAvailable, |f| {
+                    f.upgrade_path_info = Some(hotspot.info.clone());
+                });
+                self.encrypt_and_send(&available).await?;
+                let (tx, accepted) = oneshot::channel();
+                let task = TaskGuard(tokio::spawn(async move {
+                    let _ = tx.send(hotspot.accept().await);
+                }));
+                self.upgrade = Upgrade::Waiting {
+                    accepted,
+                    _task: task,
+                    peer_last_write: false,
+                };
+            }
+            UpgradeProgress::Accepted(Ok(new)) => {
+                self.encrypt_and_send(&bwu::negotiation(BwuEvent::LastWriteToPriorChannel, |_| {}))
+                    .await?;
+                self.upgrade = Upgrade::Switching { new };
+                if peer_last_write {
+                    self.send_safe_to_close().await?;
+                }
+            }
+            UpgradeProgress::Hosted(Err(err)) | UpgradeProgress::Accepted(Err(err)) => {
+                warn!("bwu: upgrade failed, staying on {:?}: {err:#}", self.medium);
+            }
+        }
+        Ok(())
+    }
+
+    async fn on_bwu_frame(
+        &mut self,
+        frame: &BandwidthUpgradeNegotiationFrame,
+    ) -> Result<(), anyhow::Error> {
+        match frame.event_type() {
+            BwuEvent::LastWriteToPriorChannel => match &mut self.upgrade {
+                Upgrade::Waiting {
+                    peer_last_write, ..
+                } => *peer_last_write = true,
+                Upgrade::Switching { .. } => self.send_safe_to_close().await?,
+                _ => warn!("bwu: unexpected last write"),
+            },
+            BwuEvent::SafeToClosePriorChannel => {
+                let Upgrade::Switching { new } = std::mem::take(&mut self.upgrade) else {
+                    warn!("bwu: unexpected safe-to-close");
+                    return Ok(());
+                };
+                // Unencrypted, like the remaining traffic on the old channel.
+                self.send_frame(bwu::disconnection().encode_to_vec())
+                    .await?;
+                let _ = self.writer.shutdown().await;
+
+                let Upgraded {
+                    transport,
+                    encrypted,
+                    wifi,
+                } = new;
+                self.plaintext = !encrypted;
+                self.medium = transport.medium();
+                let (read, writer) = tokio::io::split(transport);
+                self.generation += 1;
+                self.writer = writer;
+                self.reader = FrameReader::spawn(read, self.generation, self.frames_tx.clone());
+                self.upgrade = Upgrade::Done { _wifi: wifi };
+                info!(
+                    "bwu: upgraded to {:?} ({})",
+                    self.medium,
+                    if encrypted { "encrypted" } else { "plaintext" }
+                );
+            }
+            BwuEvent::UpgradeFailure => {
+                warn!("bwu: sender couldn't upgrade, staying on {:?}", self.medium);
+                self.upgrade = Upgrade::Failed;
+            }
+            other => info!("bwu: ignoring {other:?}: {frame:?}"),
+        }
+        Ok(())
+    }
+
+    async fn send_safe_to_close(&mut self) -> Result<(), anyhow::Error> {
+        self.encrypt_and_send(&bwu::negotiation(BwuEvent::SafeToClosePriorChannel, |_| {}))
+            .await
     }
 
     async fn reject_transfer(
@@ -1296,6 +1522,9 @@ impl InboundRequest {
     }
 
     async fn encrypt_and_send(&mut self, frame: &OfflineFrame) -> Result<(), anyhow::Error> {
+        if self.plaintext {
+            return self.send_frame(frame.encode_to_vec()).await;
+        }
         let d2d_msg = DeviceToDeviceMessage {
             sequence_number: Some(self.get_server_seq_inc().await),
             message: Some(frame.encode_to_vec()),
@@ -1341,6 +1570,10 @@ impl InboundRequest {
     }
 
     async fn send_keepalive(&mut self, ack: bool) -> Result<(), anyhow::Error> {
+        if matches!(self.upgrade, Upgrade::Switching { .. }) {
+            // Nothing may follow our last write on the old channel.
+            return Ok(());
+        }
         let ack_frame = location_nearby_connections::OfflineFrame {
             version: Some(location_nearby_connections::offline_frame::Version::V1.into()),
             v1: Some(location_nearby_connections::V1Frame {
@@ -1372,8 +1605,8 @@ impl InboundRequest {
         prefixed_length.extend_from_slice(&length_bytes);
         prefixed_length.extend_from_slice(&data);
 
-        self.socket.write_all(&prefixed_length).await?;
-        self.socket.flush().await?;
+        self.writer.write_all(&prefixed_length).await?;
+        self.writer.flush().await?;
 
         Ok(())
     }

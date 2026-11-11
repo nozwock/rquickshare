@@ -26,14 +26,15 @@ use std::time::Duration;
 use anyhow::{anyhow, bail, ensure};
 use prost::Message;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadHalf};
-use tokio::net::TcpStream;
+use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
 use super::Transport;
 use crate::location_nearby_connections::bandwidth_upgrade_negotiation_frame::upgrade_path_info::Medium;
+use crate::location_nearby_connections::bandwidth_upgrade_negotiation_frame::upgrade_path_info::WifiHotspotCredentials;
 use crate::location_nearby_connections::bandwidth_upgrade_negotiation_frame::{
-    ClientIntroduction, EventType, UpgradePathInfo,
+    ClientIntroduction, ClientIntroductionAck, EventType, UpgradePathInfo,
 };
 use crate::location_nearby_connections::{
     AvailableChannels, BandwidthUpgradeNegotiationFrame, DisconnectionFrame, MediumMetadata,
@@ -79,6 +80,16 @@ impl FrameReader {
 }
 
 impl Drop for FrameReader {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// Aborts a spawned task when dropped.
+#[derive(Debug)]
+pub(crate) struct TaskGuard(pub JoinHandle<()>);
+
+impl Drop for TaskGuard {
     fn drop(&mut self) {
         self.0.abort();
     }
@@ -236,21 +247,11 @@ pub(crate) struct WifiConnection {
 }
 
 impl WifiConnection {
-    /// `frequency` (MHz, -1 if unknown) narrows the probe to one channel.
+    /// Joins a network. `frequency` (MHz, -1 if unknown) narrows the probe
+    /// to one channel.
     pub async fn join(ssid: &str, password: &str, frequency: i32) -> Result<Self, anyhow::Error> {
         let device = wifi_device().await?;
-        let name = format!("rqs-upgrade-{}", hex::encode(rand::random::<[u8; 4]>()));
-        let user = std::env::var("USER").unwrap_or_default();
-
-        let mut add = vec![
-            "connection",
-            "add",
-            "type",
-            "wifi",
-            "ifname",
-            &device,
-            "con-name",
-            &name,
+        let mut settings = vec![
             "ssid",
             ssid,
             "wifi-sec.key-mgmt",
@@ -262,35 +263,271 @@ impl WifiConnection {
             "yes",
             "ipv4.never-default",
             "yes",
+        ];
+        let channel = channel_settings(frequency);
+        settings.extend(channel.iter().map(String::as_str));
+
+        info!("bwu: joining {ssid:?} ({frequency} MHz) on {device}");
+        Self::activate(&device, "rqs-upgrade", &settings).await
+    }
+
+    /// Hosts a WPA2 access point that hands out addresses (NetworkManager's
+    /// "shared" mode).
+    pub async fn host(
+        device: &str,
+        ssid: &str,
+        password: &str,
+        frequency: i32,
+    ) -> Result<Self, anyhow::Error> {
+        let mut settings = vec![
+            "ssid",
+            ssid,
+            "802-11-wireless.mode",
+            "ap",
+            "wifi-sec.key-mgmt",
+            "wpa-psk",
+            "wifi-sec.psk",
+            password,
+            "wifi-sec.proto",
+            "rsn",
+            "wifi-sec.pairwise",
+            "ccmp",
+            "wifi-sec.group",
+            "ccmp",
+            "ipv4.method",
+            "shared",
+        ];
+        let channel = channel_settings(frequency);
+        settings.extend(channel.iter().map(String::as_str));
+
+        info!("bwu: hosting {ssid:?} ({frequency} MHz) on {device}");
+        Self::activate(device, "rqs-hotspot", &settings).await
+    }
+
+    async fn activate(
+        device: &str,
+        prefix: &str,
+        settings: &[&str],
+    ) -> Result<Self, anyhow::Error> {
+        let name = format!("{prefix}-{}", hex::encode(rand::random::<[u8; 4]>()));
+        let user = std::env::var("USER").unwrap_or_default();
+        let permissions = format!("user:{user}");
+
+        let mut add = vec![
+            "connection",
+            "add",
+            "type",
+            "wifi",
+            "ifname",
+            device,
+            "con-name",
+            &name,
             "ipv6.method",
             "ignore",
             "connection.autoconnect",
             "no",
         ];
-        let channel = channel_of(frequency);
-        let channel_text = channel.map(|(_, c)| c.to_string()).unwrap_or_default();
-        if let Some((band, _)) = channel {
-            add.extend([
-                "802-11-wireless.band",
-                band,
-                "802-11-wireless.channel",
-                &channel_text,
-            ]);
-        }
-        let permissions = format!("user:{user}");
         if !user.is_empty() {
             // Owned by us: needs no authorization.
             add.extend(["connection.permissions", &permissions]);
         }
+        add.extend(settings);
         nmcli(&add).await?;
         let connection = Self { name };
 
-        info!("bwu: joining {ssid:?} ({frequency} MHz) on {device}");
         let started = std::time::Instant::now();
         nmcli(&["--wait", "30", "connection", "up", &connection.name]).await?;
-        info!("bwu: joined after {:?}", started.elapsed());
+        info!("bwu: {} up after {:?}", connection.name, started.elapsed());
         Ok(connection)
     }
+}
+
+/// NetworkManager settings pinning `frequency` (MHz), if it is known.
+fn channel_settings(frequency: i32) -> Vec<String> {
+    match channel_of(frequency) {
+        Some((band, channel)) => vec![
+            "802-11-wireless.band".into(),
+            band.into(),
+            "802-11-wireless.channel".into(),
+            channel.to_string(),
+        ],
+        None => Vec::new(),
+    }
+}
+
+/// A hotspot we host for the sender to move the connection to.
+#[derive(Debug)]
+pub(crate) struct Hotspot {
+    pub info: UpgradePathInfo,
+    listener: TcpListener,
+    wifi: WifiConnection,
+}
+
+impl Hotspot {
+    /// Starts a hotspot on a channel both sides can use, preferring 5 GHz.
+    /// `peer` is the medium metadata from the sender's connection request.
+    pub async fn start(peer: Option<&MediumMetadata>) -> Result<Self, anyhow::Error> {
+        let device = wifi_device().await?;
+        let ours = ap_frequencies(&iw_list().await);
+        let theirs: Vec<i32> = peer
+            .and_then(|m| {
+                m.wifi_hotspot_sta_usable_channels
+                    .as_ref()
+                    .map(|c| &c.channels)
+                    .or(m.available_channels.as_ref().map(|c| &c.channels))
+            })
+            .cloned()
+            .unwrap_or_default();
+        let peer_5_ghz = peer.is_some_and(|m| m.supports_5_ghz());
+        let candidates = hotspot_frequencies(&ours, &theirs, peer_5_ghz);
+
+        let ssid = format!("DIRECT-{}", random_text(8));
+        let password = random_text(16);
+        let mut last_err = anyhow!("no usable channel");
+        let mut hosted = None;
+        for frequency in candidates {
+            match WifiConnection::host(&device, &ssid, &password, frequency).await {
+                Ok(wifi) => {
+                    hosted = Some((wifi, frequency));
+                    break;
+                }
+                Err(err) => {
+                    warn!("bwu: couldn't host on {frequency} MHz: {err}");
+                    last_err = err;
+                }
+            }
+        }
+        let (wifi, frequency) = hosted.ok_or(last_err)?;
+
+        let gateway = tokio::time::timeout(CONNECT_TIMEOUT, async {
+            loop {
+                if let Ok(out) = nmcli(&["-g", "IP4.ADDRESS", "device", "show", &device]).await {
+                    if let Some(ip) = out.lines().next().and_then(|l| l.split('/').next()) {
+                        if let Ok(ip) = ip.trim().parse::<std::net::Ipv4Addr>() {
+                            return ip;
+                        }
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+        })
+        .await
+        .map_err(|_| anyhow!("hotspot got no address"))?;
+        let listener = TcpListener::bind((gateway, 0)).await?;
+        let port = listener.local_addr()?.port();
+        info!("bwu: hotspot {ssid:?} up, listening on {gateway}:{port}");
+
+        let info = UpgradePathInfo {
+            medium: Some(Medium::WifiHotspot.into()),
+            wifi_hotspot_credentials: Some(WifiHotspotCredentials {
+                ssid: Some(ssid),
+                password: Some(password),
+                port: Some(port.into()),
+                gateway: Some(gateway.to_string()),
+                frequency: Some(frequency),
+            }),
+            supports_disabling_encryption: Some(true),
+            supports_client_introduction_ack: Some(true),
+            ..Default::default()
+        };
+        Ok(Self {
+            info,
+            listener,
+            wifi,
+        })
+    }
+
+    /// Waits for the sender to connect and introduce itself.
+    pub async fn accept(self) -> Result<Upgraded, anyhow::Error> {
+        let (mut stream, peer) =
+            tokio::time::timeout(Duration::from_secs(45), self.listener.accept())
+                .await
+                .map_err(|_| anyhow!("sender didn't join the hotspot"))??;
+        stream.set_nodelay(true)?;
+        info!("bwu: {peer} connected over the hotspot");
+
+        let frame = tokio::time::timeout(INTRODUCTION_TIMEOUT, read_frame(&mut stream))
+            .await
+            .map_err(|_| anyhow!("no client introduction"))??;
+        let negotiation_frame = OfflineFrame::decode(&*frame)?
+            .v1
+            .and_then(|v1| v1.bandwidth_upgrade_negotiation)
+            .ok_or_else(|| anyhow!("expected a client introduction"))?;
+        ensure!(
+            negotiation_frame.event_type() == EventType::ClientIntroduction,
+            "expected a client introduction, got {:?}",
+            negotiation_frame.event_type()
+        );
+        let introduction = negotiation_frame.client_introduction.unwrap_or_default();
+        debug!("bwu: client introduction {introduction:?}");
+
+        let ack = negotiation(EventType::ClientIntroductionAck, |f| {
+            f.client_introduction_ack = Some(ClientIntroductionAck {});
+        });
+        write_frame(&mut stream, &ack.encode_to_vec()).await?;
+
+        Ok(Upgraded {
+            transport: Transport::new(Medium::WifiHotspot, stream),
+            encrypted: !introduction.supports_disabling_encryption(),
+            wifi: self.wifi,
+        })
+    }
+}
+
+/// Channels to try hosting on, best first: 5 GHz ones both sides can use,
+/// then 2.4 GHz, then whatever NetworkManager picks (-1).
+fn hotspot_frequencies(ours: &[i32], theirs: &[i32], peer_5_ghz: bool) -> Vec<i32> {
+    let shared = |f: &i32| theirs.is_empty() || theirs.contains(f);
+    let mut candidates: Vec<i32> = Vec::new();
+    if peer_5_ghz {
+        candidates.extend(ours.iter().filter(|f| **f >= 5000 && shared(f)).take(1));
+    }
+    candidates.extend(
+        ours.iter()
+            .filter(|f| **f < 5000 && shared(f))
+            .min_by_key(|f| (**f - 2437).abs())
+            .copied(),
+    );
+    candidates.push(-1);
+    candidates
+}
+
+fn random_text(len: usize) -> String {
+    use rand::Rng;
+    rand::rng()
+        .sample_iter(rand::distr::Alphanumeric)
+        .take(len)
+        .map(char::from)
+        .collect()
+}
+
+async fn iw_list() -> String {
+    match tokio::process::Command::new("iw")
+        .arg("list")
+        .output()
+        .await
+    {
+        Ok(out) => String::from_utf8_lossy(&out.stdout).into_owned(),
+        Err(_) => String::new(),
+    }
+}
+
+/// Frequencies (MHz) we may start transmitting on, i.e. host an AP.
+fn ap_frequencies(iw_list: &str) -> Vec<i32> {
+    let mut frequencies: Vec<i32> = iw_list
+        .lines()
+        .filter_map(|l| l.trim().strip_prefix("* "))
+        .filter(|l| {
+            l.contains(" MHz")
+                && !l.contains("disabled")
+                && !l.contains("no IR")
+                && !l.contains("radar")
+        })
+        .filter_map(|l| l.split(" MHz").next()?.split('.').next()?.parse().ok())
+        .collect();
+    frequencies.sort_unstable();
+    frequencies.dedup();
+    frequencies
 }
 
 impl Drop for WifiConnection {
@@ -320,14 +557,7 @@ fn channel_of(frequency: i32) -> Option<(&'static str, i32)> {
 pub(crate) async fn local_medium_metadata() -> Option<MediumMetadata> {
     let device = wifi_device().await.ok()?;
 
-    let frequencies: Vec<i32> = match tokio::process::Command::new("iw")
-        .arg("list")
-        .output()
-        .await
-    {
-        Ok(out) => usable_frequencies(&String::from_utf8_lossy(&out.stdout)),
-        Err(_) => Vec::new(),
-    };
+    let frequencies = usable_frequencies(&iw_list().await);
     let props = nmcli(&[
         "-t",
         "-f",
@@ -442,6 +672,23 @@ mod tests {
         let iw = "\t\t\t* 2412 MHz [1] (22.0 dBm)\n\t\t\t* 2467 MHz [12] (disabled)\n\
                   \t\t\t* 5180.0 MHz [36] (22.0 dBm)\n\t\t\t* MCS: ff\n";
         assert_eq!(usable_frequencies(iw), vec![2412, 5180]);
+    }
+
+    #[test]
+    fn picks_hotspot_channels() {
+        let ours = [2412, 2437, 2462, 5180, 5240, 5745];
+        assert_eq!(
+            hotspot_frequencies(&ours, &[2437, 5240, 5745], true),
+            vec![5240, 2437, -1]
+        );
+        assert_eq!(hotspot_frequencies(&ours, &[], false), vec![2437, -1]);
+        assert_eq!(hotspot_frequencies(&[], &[], true), vec![-1]);
+    }
+
+    #[test]
+    fn ap_frequencies_skip_no_ir() {
+        let iw = "* 2412 MHz [1] (22.0 dBm)\n* 5260 MHz [52] (22.0 dBm) (no IR, radar detection)\n";
+        assert_eq!(ap_frequencies(iw), vec![2412]);
     }
 
     #[test]
