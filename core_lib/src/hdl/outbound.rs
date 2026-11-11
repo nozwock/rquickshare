@@ -33,7 +33,8 @@ use crate::location_nearby_connections::payload_transfer_frame::{
     PacketType, PayloadChunk, PayloadHeader, payload_header,
 };
 use crate::location_nearby_connections::{
-    BandwidthUpgradeNegotiationFrame, KeepAliveFrame, OfflineFrame, PayloadTransferFrame,
+    BandwidthUpgradeNegotiationFrame, KeepAliveFrame, MediumMetadata, OfflineFrame,
+    PayloadTransferFrame,
 };
 use crate::securegcm::ukey2_alert::AlertType;
 use crate::securegcm::ukey2_client_init::CipherCommitment;
@@ -292,6 +293,8 @@ impl OutboundRequest {
 
     pub async fn send_connection_request(&mut self) -> Result<(), anyhow::Error> {
         let device_name = DEVICE_NAME.read().unwrap().clone();
+        let (mediums, medium_metadata) = upgrade_mediums(self.medium).await;
+        debug!("Offering upgrade mediums {mediums:?}, {medium_metadata:?}");
         let request = location_nearby_connections::OfflineFrame {
             version: Some(location_nearby_connections::offline_frame::Version::V1.into()),
             v1: Some(location_nearby_connections::V1Frame {
@@ -308,7 +311,8 @@ impl OutboundRequest {
                         }
                         .serialize(),
                     ),
-                    mediums: upgrade_mediums(),
+                    mediums,
+                    medium_metadata,
                     ..Default::default()
                 }),
                 ..Default::default()
@@ -1705,22 +1709,19 @@ impl OutboundRequest {
     }
 }
 
-/// Mediums we tell the receiver it may upgrade the connection to.
+/// Mediums we tell the receiver it may upgrade the connection to, and
+/// what it needs to know about our Wi-Fi to pick one.
 ///
-/// `RQS_UPGRADE_MEDIUMS` (comma-separated, e.g. `hotspot,direct`) adds more,
-/// to observe what a receiver offers; they are not supported yet.
-fn upgrade_mediums() -> Vec<i32> {
+/// Wi-Fi Direct and hotspots mean leaving the current Wi-Fi network for the
+/// transfer, which is only worth it coming from Bluetooth.
+async fn upgrade_mediums(current: Medium) -> (Vec<i32>, Option<MediumMetadata>) {
     let mut mediums = vec![Medium::WifiLan];
-    for name in std::env::var("RQS_UPGRADE_MEDIUMS")
-        .unwrap_or_default()
-        .split(',')
-    {
-        match name.trim() {
-            "hotspot" => mediums.push(Medium::WifiHotspot),
-            "direct" => mediums.push(Medium::WifiDirect),
-            "" => {}
-            other => warn!("RQS_UPGRADE_MEDIUMS: unknown medium {other:?}"),
+    let mut metadata = None;
+    if current == Medium::Bluetooth {
+        metadata = bwu::local_medium_metadata().await;
+        if metadata.is_some() {
+            mediums.extend([Medium::WifiDirect, Medium::WifiHotspot]);
         }
     }
-    mediums.into_iter().map(Into::into).collect()
+    (mediums.into_iter().map(Into::into).collect(), metadata)
 }

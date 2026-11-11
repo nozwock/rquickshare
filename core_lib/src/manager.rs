@@ -180,7 +180,12 @@ impl TcpServer {
                                     break;
                                 }
 
-                                if or.state.state != TransferState::Finished && or.state.state != TransferState::Cancelled {
+                                if or.state.state == TransferState::Finished {
+                                    // The receiver closes the connection once it has everything.
+                                    debug!("{INNER_NAME}: connection closed after the transfer: {e}");
+                                    break;
+                                }
+                                if or.state.state != TransferState::Cancelled {
                                     let _ = self.sender.clone().send(ChannelMessage {
                                         id: si.id,
                                         msg: channel::Message::Client(MessageClient {
