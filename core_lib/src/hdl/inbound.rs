@@ -70,6 +70,9 @@ pub struct InboundRequest {
     /// What the sender said it can upgrade to.
     sender_mediums: Vec<RequestMedium>,
     sender_metadata: Option<MediumMetadata>,
+    /// Receive timing while receiving files: (start, time spent handling
+    /// frames, frames handled, most frames queued at once).
+    timing: Option<(std::time::Instant, Duration, u64, usize)>,
     pub state: InnerState,
     sender: Sender<ChannelMessage>,
     receiver: Receiver<ChannelMessage>,
@@ -142,6 +145,7 @@ impl InboundRequest {
             upgrade: Upgrade::None,
             sender_mediums: Vec::new(),
             sender_metadata: None,
+            timing: None,
             state: InnerState {
                 id,
                 server_seq: 0,
@@ -208,7 +212,12 @@ impl InboundRequest {
                 };
                 if incoming.generation == self.generation {
                     let frame = incoming.frame.map_err(|e| anyhow!(e))?;
-                    self._handle(frame).await?
+                    let queued = self.frames.len();
+                    let started = std::time::Instant::now();
+                    // Finishing ends with an error that stops the request.
+                    let handled = self._handle(frame).await;
+                    self.record_timing(started, queued);
+                    handled?;
                 }
             }
             progress = upgrade_progress(&mut self.upgrade) => {
@@ -1222,6 +1231,29 @@ impl InboundRequest {
         Ok(())
     }
 
+    fn record_timing(&mut self, started: std::time::Instant, queued: usize) {
+        match self.state.state {
+            TransferState::ReceivingFiles => {
+                let t = self.timing.get_or_insert((started, Duration::ZERO, 0, 0));
+                t.1 += started.elapsed();
+                t.2 += 1;
+                t.3 = t.3.max(queued);
+            }
+            TransferState::Finished => {
+                if let Some((start, busy, frames, max_queued)) = self.timing.take() {
+                    let wall = start.elapsed();
+                    info!(
+                        "timing: {frames} frames in {wall:?}, handling them took {busy:?} ({:.0}%), \
+                         at most {max_queued} queued, on {:?}",
+                        100.0 * busy.as_secs_f64() / wall.as_secs_f64().max(1e-9),
+                        self.medium
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+
     /// Like Android, offers a faster medium once the transfer is accepted.
     /// Hosting a hotspot takes over the Wi-Fi adapter for the transfer, so
     /// only do it to get off Bluetooth.
@@ -1320,6 +1352,8 @@ impl InboundRequest {
                 self.writer = writer;
                 self.reader = FrameReader::spawn(read, self.generation, self.frames_tx.clone());
                 self.upgrade = Upgrade::Done { _wifi: wifi };
+                // Measure the transfer on the new medium only.
+                self.timing = None;
                 info!(
                     "bwu: upgraded to {:?} ({})",
                     self.medium,
