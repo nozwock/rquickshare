@@ -82,6 +82,8 @@ impl BleDiscovery {
         let mut resolved: HashMap<[u8; 4], String> = HashMap::new();
         let mut failed: HashMap<[u8; 4], Instant> = HashMap::new();
         let mut endpoints: HashMap<String, Known> = HashMap::new();
+        // Last 0xFEF3 payload per advertiser, to trace only changes.
+        let mut last_payload: HashMap<Address, Vec<u8>> = HashMap::new();
         let mut sweep = tokio::time::interval(SWEEP_INTERVAL);
 
         loop {
@@ -104,8 +106,16 @@ impl BleDiscovery {
             let Some(data) = self.nearby_service_data(addr).await else {
                 continue;
             };
+            let parsed = adv::parse_service_data(&data, SERVICE_ID);
+            if last_payload.get(&addr) != Some(&data) {
+                trace!(
+                    "{INNER_NAME}: {addr} 0xFEF3 {}: {parsed:?}",
+                    hex::encode(&data)
+                );
+                last_payload.insert(addr, data.clone());
+            }
 
-            let (adv, adv_hash) = match adv::parse_service_data(&data, SERVICE_ID) {
+            let (adv, adv_hash) = match parsed {
                 Ok(ServiceData::Regular(adv)) => (adv, None),
                 Ok(ServiceData::Header { adv_hash }) => {
                     if let Some(known) = resolved.get(&adv_hash).and_then(|a| endpoints.get_mut(a))

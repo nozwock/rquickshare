@@ -151,7 +151,7 @@ impl TcpServer {
         let mut or = OutboundRequest::new(
             self.endpoint_id,
             socket,
-            si.id,
+            si.id.clone(),
             self.sender.clone(),
             si.ob,
             RemoteDeviceInfo {
@@ -182,7 +182,7 @@ impl TcpServer {
 
                                 if or.state.state != TransferState::Finished && or.state.state != TransferState::Cancelled {
                                     let _ = self.sender.clone().send(ChannelMessage {
-                                        id: si.addr,
+                                        id: si.id,
                                         msg: channel::Message::Client(MessageClient {
                                             kind: TransferKind::Outbound,
                                             state: Some(TransferState::Disconnected),

@@ -22,13 +22,14 @@ pub struct EndpointInfo {
 }
 
 impl EndpointInfo {
-    /// Address to put in [`SendInfo::addr`](crate::SendInfo::addr): the
-    /// Bluetooth address when known, otherwise `ip:port`.
+    /// Address to put in [`SendInfo::addr`](crate::SendInfo::addr):
+    /// `ip:port` when the endpoint is on the LAN (much faster), otherwise
+    /// its Bluetooth address.
     pub fn send_address(&self) -> Option<String> {
-        if let Some(addr) = &self.bluetooth_address {
-            return Some(addr.clone());
+        if let (Some(ip), Some(port)) = (&self.ip, &self.port) {
+            return Some(format!("{ip}:{port}"));
         }
-        Some(format!("{}:{}", self.ip.as_ref()?, self.port.as_ref()?))
+        self.bluetooth_address.clone()
     }
 }
 

@@ -201,6 +201,17 @@ impl RQS {
         let ctk = CancellationToken::new();
         self.discovery_ctk = Some(ctk.clone());
 
+        // Each medium reports into its own channel; one entry per endpoint
+        // (merged across mediums) is forwarded to `sender`.
+        let (mdns_tx, mdns_rx) = broadcast::channel(16);
+        let (ble_tx, ble_rx) = broadcast::channel(16);
+        tracker.spawn(hdl::endpoint_merge::forward(
+            mdns_rx,
+            ble_rx,
+            sender,
+            ctk.clone(),
+        ));
+
         #[cfg(all(feature = "experimental", target_os = "linux"))]
         {
             let ctk_blea = ctk.clone();
@@ -221,10 +232,9 @@ impl RQS {
 
         #[cfg(all(feature = "experimental", target_os = "linux"))]
         {
-            let sender = sender.clone();
             let ctk_ble = ctk.clone();
             tracker.spawn(async move {
-                match hdl::BleDiscovery::new(sender).await {
+                match hdl::BleDiscovery::new(ble_tx).await {
                     Ok(discovery) => {
                         if let Err(e) = discovery.run(ctk_ble).await {
                             error!("BleDiscovery: {}", e);
@@ -234,8 +244,10 @@ impl RQS {
                 }
             });
         }
+        #[cfg(not(all(feature = "experimental", target_os = "linux")))]
+        drop(ble_tx);
 
-        let discovery = MDnsDiscovery::new(sender)?;
+        let discovery = MDnsDiscovery::new(mdns_tx)?;
         tracker.spawn(async move { discovery.run(ctk.clone()).await });
 
         Ok(())

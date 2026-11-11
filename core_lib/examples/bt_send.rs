@@ -39,7 +39,10 @@ async fn main() -> Result<(), anyhow::Error> {
         let endpoint = tokio::time::timeout(Duration::from_secs(120), async {
             loop {
                 let e = found.recv().await?;
-                println!("found: {:?} {:?} {:?}", e.name, e.rtype, e.send_address());
+                println!(
+                    "found: id={} name={:?} ip={:?} bt={:?} present={:?}",
+                    e.id, e.name, e.ip, e.bluetooth_address, e.present
+                );
                 if e.bluetooth_address.is_some() {
                     return Ok::<_, anyhow::Error>(e);
                 }
@@ -48,7 +51,8 @@ async fn main() -> Result<(), anyhow::Error> {
         .await
         .map_err(|_| anyhow::anyhow!("no receiver found over BLE"))??;
         rqs.stop_discovery();
-        let addr = endpoint.send_address().unwrap();
+        // This example is about Bluetooth: don't let a LAN address win.
+        let addr = endpoint.bluetooth_address.clone().unwrap();
         (addr.clone(), endpoint.name.unwrap_or(addr))
     } else {
         anyhow::ensure!(
