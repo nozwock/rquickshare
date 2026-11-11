@@ -24,6 +24,8 @@ mod mdns;
 pub use mdns::*;
 mod outbound;
 pub use outbound::*;
+pub mod transport;
+pub use transport::{Transport, TransportStream};
 
 #[allow(dead_code)]
 #[derive(Debug, Clone, Default, PartialEq)]

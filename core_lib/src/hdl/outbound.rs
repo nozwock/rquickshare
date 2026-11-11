@@ -16,12 +16,11 @@ use prost::Message;
 use rand::Rng;
 use sha2::{Digest, Sha256, Sha512};
 use tokio::io::AsyncWriteExt;
-use tokio::net::TcpStream;
 use tokio::sync::broadcast::error::TryRecvError;
 use tokio::sync::broadcast::{Receiver, Sender};
 
 use super::info::{InternalFileInfo, TransferMetadata, TransferPayload, TransferPayloadKind};
-use super::{InnerState, TextPayloadInfo, TextPayloadType, TransferState};
+use super::{InnerState, TextPayloadInfo, TextPayloadType, TransferState, Transport};
 use crate::channel::{self, ChannelMessage, MessageClient, TransferAction, TransferKind};
 use crate::location_nearby_connections::bandwidth_upgrade_negotiation_frame::upgrade_path_info::Medium;
 use crate::location_nearby_connections::connection_response_frame::ResponseStatus;
@@ -66,7 +65,7 @@ pub enum OutboundPayload {
 #[derive(Debug)]
 pub struct OutboundRequest {
     endpoint_id: [u8; 4],
-    socket: TcpStream,
+    socket: Transport,
     pub state: InnerState,
     sender: Sender<ChannelMessage>,
     receiver: Receiver<ChannelMessage>,
@@ -76,7 +75,7 @@ pub struct OutboundRequest {
 impl OutboundRequest {
     pub fn new(
         endpoint_id: [u8; 4],
-        socket: TcpStream,
+        socket: impl Into<Transport>,
         id: String,
         sender: Sender<ChannelMessage>,
         payload: OutboundPayload,
@@ -124,7 +123,7 @@ impl OutboundRequest {
 
         Self {
             endpoint_id,
-            socket,
+            socket: socket.into(),
             state: InnerState {
                 id,
                 server_seq: 0,
