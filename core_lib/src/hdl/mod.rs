@@ -21,6 +21,10 @@ pub use ble_discovery::BleDiscovery;
 pub mod bluetooth;
 #[cfg(all(feature = "experimental", target_os = "linux"))]
 pub use blea::*;
+#[cfg(all(feature = "experimental", target_os = "linux"))]
+mod nearby_advertiser;
+#[cfg(all(feature = "experimental", target_os = "linux"))]
+pub use nearby_advertiser::NearbyAdvertiser;
 pub(crate) mod endpoint_merge;
 mod inbound;
 pub use inbound::*;

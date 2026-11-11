@@ -155,7 +155,23 @@ impl RQS {
         #[cfg(all(feature = "experimental", target_os = "linux"))]
         {
             match hdl::bluetooth::BluetoothServer::new().await {
-                Ok(bt) => server.set_bluetooth(bt),
+                Ok(bt) => {
+                    server.set_bluetooth(bt);
+                    // Only worth advertising if we can accept the connection.
+                    match hdl::NearbyAdvertiser::new(
+                        endpoint_id[..4].try_into()?,
+                        &DEVICE_NAME,
+                        self.visibility_receiver.clone(),
+                    )
+                    .await
+                    {
+                        Ok(advertiser) => {
+                            let ctk = ctoken.clone();
+                            tracker.spawn(async move { advertiser.run(ctk).await });
+                        }
+                        Err(err) => warn!("NearbyAdvertiser: {}", err),
+                    }
+                }
                 Err(err) => warn!("BluetoothServer: {}", err),
             }
         }

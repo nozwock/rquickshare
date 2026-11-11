@@ -13,6 +13,10 @@ path = "src/bin.rs"
 name = "bt_send"
 required-features = ["experimental"]
 
+[[example]]
+name = "bt_receive"
+required-features = ["experimental"]
+
 [target.'cfg(target_os = "linux")'.dependencies]
 bluer = { version = "0.17", features = ["full"], optional = true }
 libc = "0.2"

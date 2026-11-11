@@ -10,7 +10,7 @@
 //! Fast advertisements (hidden / contacts-only receivers) carry no address
 //! and are ignored.
 
-mod adv;
+pub(crate) mod adv;
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};

@@ -21,6 +21,7 @@ use sha2::{Digest, Sha256};
 
 /// BLE medium advertisement flags (byte 0).
 const MEDIUM_VERSION_V2: u8 = 2;
+const MEDIUM_SOCKET_VERSION_V2: u8 = 2;
 const MEDIUM_FAST_FLAG: u8 = 0x02;
 /// Connections-level advertisement byte 0: version (3 bits) | PCP (5 bits).
 const CONNECTIONS_VERSION_V1: u8 = 1;
@@ -102,6 +103,147 @@ pub fn parse_regular(data: &[u8], service_id: &str) -> Result<NearbyAdvertisemen
         .get(8..8 + len)
         .ok_or_else(|| anyhow!("truncated regular advertisement"))?;
     parse_connections(body, Some(&hash))
+}
+
+/// Builds a regular advertisement (the inverse of [`parse_regular`]) for an
+/// endpoint reachable over Bluetooth Classic at `bluetooth_address`.
+pub fn build_regular(
+    service_id: &str,
+    endpoint_id: [u8; ENDPOINT_ID_LEN],
+    endpoint_info: &[u8],
+    bluetooth_address: [u8; 6],
+    device_token: [u8; 2],
+) -> Result<Vec<u8>, anyhow::Error> {
+    let hash = service_id_hash(service_id);
+
+    let mut connections = Vec::with_capacity(17 + endpoint_info.len());
+    connections.push((CONNECTIONS_VERSION_V1 << 5) | PCP_P2P_POINT_TO_POINT);
+    connections.extend_from_slice(&hash);
+    connections.extend_from_slice(&endpoint_id);
+    connections.push(u8::try_from(endpoint_info.len())?);
+    connections.extend_from_slice(endpoint_info);
+    connections.extend_from_slice(&bluetooth_address);
+    connections.push(0); // no UWB address
+    connections.push(0); // extra field: not WebRTC connectable
+
+    let mut medium = Vec::with_capacity(10 + connections.len());
+    medium.push((MEDIUM_VERSION_V2 << 5) | (MEDIUM_SOCKET_VERSION_V2 << 2));
+    medium.extend_from_slice(&hash);
+    medium.extend_from_slice(&u32::try_from(connections.len())?.to_be_bytes());
+    medium.extend_from_slice(&connections);
+    medium.extend_from_slice(&device_token);
+    Ok(medium)
+}
+
+/// Length of the random service id mixed into a header to anonymise it.
+const DUMMY_SERVICE_ID_LEN: usize = 128;
+const BLOOM_FILTER_LEN: usize = 10;
+const BLOOM_FILTER_HASHES: i32 = 5;
+
+/// Builds the header advertised in place of a full advertisement that is too
+/// long for legacy advertising (`Ble::CreateAdvertisementHeader`): one GATT
+/// slot holding `gatt_advertisement`, no extended advertisement, no L2CAP
+/// PSM. Returned as base64url text, the way Android publishes it.
+pub fn build_header(service_id: &str, gatt_advertisement: &[u8]) -> String {
+    let mut dummy = [0u8; DUMMY_SERVICE_ID_LEN];
+    rand::Rng::fill(&mut rand::rng(), &mut dummy[..]);
+    URL_SAFE_NO_PAD.encode(header_bytes(service_id, &dummy, gatt_advertisement))
+}
+
+fn header_bytes(service_id: &str, dummy_service_id: &[u8], gatt_advertisement: &[u8]) -> Vec<u8> {
+    let mut bloom = [0u8; BLOOM_FILTER_LEN];
+    bloom_add(&mut bloom, dummy_service_id);
+    bloom_add(&mut bloom, service_id.as_bytes());
+
+    let seed = Sha256::digest(dummy_service_id);
+    let adv_hash = Sha256::new()
+        .chain_update(&seed[..4])
+        .chain_update(gatt_advertisement)
+        .finalize();
+
+    let mut header = Vec::with_capacity(HEADER_LEN);
+    header.push((MEDIUM_VERSION_V2 << 5) | 1); // not extended, 1 slot
+    header.extend_from_slice(&bloom);
+    header.extend_from_slice(&adv_hash[..4]);
+    header.extend_from_slice(&[0, 0]); // PSM
+    header
+}
+
+/// Bit positions of `s` in the header's service id bloom filter
+/// (`mediums::BloomFilter`).
+fn bloom_positions(s: &[u8]) -> impl Iterator<Item = usize> {
+    let (h, _) = murmur3_x64_128(s, 0);
+    let (hash1, hash2) = (h as i32, (h >> 32) as i32);
+    (1..=BLOOM_FILTER_HASHES).map(move |i| {
+        let combined = hash1.wrapping_add(i.wrapping_mul(hash2));
+        let combined = if combined < 0 { !combined } else { combined };
+        combined as usize % (BLOOM_FILTER_LEN * 8)
+    })
+}
+
+fn bloom_add(filter: &mut [u8; BLOOM_FILTER_LEN], s: &[u8]) {
+    for p in bloom_positions(s) {
+        filter[p / 8] |= 1 << (p % 8);
+    }
+}
+
+#[cfg(test)]
+fn bloom_contains(filter: &[u8], s: &[u8]) -> bool {
+    bloom_positions(s).all(|p| filter[p / 8] & (1 << (p % 8)) != 0)
+}
+
+/// MurmurHash3_x64_128; returns (h1, h2), i.e. (low, high) 64 bits.
+fn murmur3_x64_128(data: &[u8], seed: u64) -> (u64, u64) {
+    const C1: u64 = 0x87c3_7b91_1142_53d5;
+    const C2: u64 = 0x4cf5_ad43_2745_937f;
+    fn fmix(mut k: u64) -> u64 {
+        k ^= k >> 33;
+        k = k.wrapping_mul(0xff51_afd7_ed55_8ccd);
+        k ^= k >> 33;
+        k = k.wrapping_mul(0xc4ce_b9fe_1a85_ec53);
+        k ^ (k >> 33)
+    }
+    let mix_k1 = |k: u64| k.wrapping_mul(C1).rotate_left(31).wrapping_mul(C2);
+    let mix_k2 = |k: u64| k.wrapping_mul(C2).rotate_left(33).wrapping_mul(C1);
+
+    let (mut h1, mut h2) = (seed, seed);
+    let mut blocks = data.chunks_exact(16);
+    for block in &mut blocks {
+        let k1 = u64::from_le_bytes(block[..8].try_into().unwrap());
+        let k2 = u64::from_le_bytes(block[8..].try_into().unwrap());
+        h1 ^= mix_k1(k1);
+        h1 = h1
+            .rotate_left(27)
+            .wrapping_add(h2)
+            .wrapping_mul(5)
+            .wrapping_add(0x52dc_e729);
+        h2 ^= mix_k2(k2);
+        h2 = h2
+            .rotate_left(31)
+            .wrapping_add(h1)
+            .wrapping_mul(5)
+            .wrapping_add(0x3849_5ab5);
+    }
+
+    let tail = blocks.remainder();
+    let mut padded = [0u8; 16];
+    padded[..tail.len()].copy_from_slice(tail);
+    if tail.len() > 8 {
+        h2 ^= mix_k2(u64::from_le_bytes(padded[8..].try_into().unwrap()));
+    }
+    if !tail.is_empty() {
+        h1 ^= mix_k1(u64::from_le_bytes(padded[..8].try_into().unwrap()));
+    }
+
+    h1 ^= data.len() as u64;
+    h2 ^= data.len() as u64;
+    h1 = h1.wrapping_add(h2);
+    h2 = h2.wrapping_add(h1);
+    h1 = fmix(h1);
+    h2 = fmix(h2);
+    h1 = h1.wrapping_add(h2);
+    h2 = h2.wrapping_add(h1);
+    (h1, h2)
 }
 
 /// Parses a connections-level advertisement. `service_hash` is `None` for
@@ -257,6 +399,27 @@ mod tests {
     }
 
     #[test]
+    fn built_advertisement_parses_back() {
+        let info = crate::utils::gen_endpoint_info(DeviceType::Laptop as u8, "my-laptop");
+        let mac = [0xe4, 0x0d, 0x36, 0x00, 0x00, 0x01];
+        let built = build_regular(SERVICE_ID, *b"AB12", &info, mac, [0x12, 0x34]).unwrap();
+
+        // Same framing as the captured phone advertisement.
+        assert_eq!(&built[..4], &[0x48, 0xfc, 0x9f, 0x5e]);
+        assert_eq!(&built[built.len() - 2..], &[0x12, 0x34]);
+
+        let adv = parse_regular(&built, SERVICE_ID).unwrap();
+        assert_eq!(adv.endpoint_id, "AB12");
+        assert_eq!(adv.endpoint_info, info);
+        assert_eq!(adv.bluetooth_address, Some(mac));
+        let (device_type, name) = parse_endpoint_info(&adv.endpoint_info).unwrap();
+        assert_eq!(
+            (device_type, name.as_deref()),
+            (DeviceType::Laptop, Some("my-laptop"))
+        );
+    }
+
+    #[test]
     fn zero_mac_means_absent() {
         let mut data = regular();
         let mac_at = 8 + 1 + 3 + 4 + 1 + 30;
@@ -265,5 +428,39 @@ mod tests {
             parse_regular(&data, SERVICE_ID).unwrap().bluetooth_address,
             None
         );
+    }
+
+    #[test]
+    fn murmur3_matches_reference() {
+        assert_eq!(murmur3_x64_128(b"", 0), (0, 0));
+        // smhasher reference: "The quick brown fox jumps over the lazy dog".
+        assert_eq!(
+            murmur3_x64_128(b"The quick brown fox jumps over the lazy dog", 0),
+            (0xe34bbc7bbc071b6c, 0x7a433ca9c49a9347)
+        );
+    }
+
+    #[test]
+    fn captured_header_bloom_contains_service_id() {
+        let header = decode_header(b"VSAACFACACADAQFQDlSFAAA").unwrap();
+        let bloom = &header[1..1 + BLOOM_FILTER_LEN];
+        assert!(bloom_contains(bloom, SERVICE_ID.as_bytes()));
+        assert!(!bloom_contains(bloom, b"SomeOtherService"));
+    }
+
+    #[test]
+    fn built_header_parses_back() {
+        let gatt = b"advertisement";
+        let dummy = [7u8; DUMMY_SERVICE_ID_LEN];
+        let bytes = header_bytes(SERVICE_ID, &dummy, gatt);
+        assert_eq!(bytes.len(), HEADER_LEN);
+        assert!(bloom_contains(&bytes[1..11], SERVICE_ID.as_bytes()));
+
+        let text = build_header(SERVICE_ID, gatt);
+        assert!(text.len() <= 27, "must fit in legacy advertising");
+        assert!(matches!(
+            parse_service_data(text.as_bytes(), SERVICE_ID).unwrap(),
+            ServiceData::Header { .. }
+        ));
     }
 }

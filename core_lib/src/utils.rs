@@ -82,6 +82,11 @@ pub fn gen_mdns_name(endpoint_id: [u8; 4]) -> String {
 }
 
 pub fn gen_mdns_endpoint_info(device_type: u8, device_name: &str) -> String {
+    URL_SAFE_NO_PAD.encode(gen_endpoint_info(device_type, device_name))
+}
+
+/// Quick Share endpoint info for an endpoint visible to everyone.
+pub fn gen_endpoint_info(device_type: u8, device_name: &str) -> Vec<u8> {
     let mut record = Vec::new();
 
     // 1 byte: Version(3 bits)|Visibility(1 bit)|Device Type(3 bits)|Reserved(1 bits)
@@ -96,7 +101,7 @@ pub fn gen_mdns_endpoint_info(device_type: u8, device_name: &str) -> String {
     record.push(length);
     record.extend_from_slice(device_name);
 
-    URL_SAFE_NO_PAD.encode(&record)
+    record
 }
 
 pub fn parse_mdns_endpoint_info(encoded_str: &str) -> Result<(DeviceType, String), anyhow::Error> {
