@@ -2,6 +2,7 @@
 //!
 //!     cargo run --example bt_send -- AA:BB:CC:DD:EE:FF "hello"
 //!     cargo run --example bt_send -- discover "hello"
+//!     cargo run --example bt_send -- AA:BB:CC:DD:EE:FF file:/path/to/file
 //!
 //! The receiver must be in Quick Share's receiving mode and visible to
 //! everyone. With `discover`, the first receiver found over BLE is used;
@@ -25,7 +26,7 @@ async fn main() -> Result<(), anyhow::Error> {
 
     let mut args = std::env::args().skip(1);
     let (Some(target), Some(text)) = (args.next(), args.next()) else {
-        anyhow::bail!("usage: bt_send <BLUETOOTH_ADDRESS|discover> <TEXT>");
+        anyhow::bail!("usage: bt_send <BLUETOOTH_ADDRESS|discover> <TEXT|file:PATH>");
     };
 
     let mut rqs = RQS::new(Visibility::Invisible, None, None, None);
@@ -67,9 +68,12 @@ async fn main() -> Result<(), anyhow::Error> {
         id: addr.clone(),
         name,
         addr: addr.clone(),
-        ob: OutboundPayload::Text {
-            text,
-            text_type: TextPayloadType::Text,
+        ob: match text.strip_prefix("file:") {
+            Some(path) => OutboundPayload::Files(vec![path.to_owned()]),
+            None => OutboundPayload::Text {
+                text,
+                text_type: TextPayloadType::Text,
+            },
         },
     })
     .await?;
@@ -107,6 +111,8 @@ async fn main() -> Result<(), anyhow::Error> {
     })
     .await;
 
+    // The connection stays open briefly; log what the receiver still sends.
+    tokio::time::sleep(Duration::from_secs(5)).await;
     rqs.stop().await;
     match outcome {
         Ok(Ok(state)) => println!("result: {state:?}"),

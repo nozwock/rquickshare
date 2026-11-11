@@ -264,7 +264,7 @@ impl OutboundRequest {
                         }
                         .serialize(),
                     ),
-                    mediums: vec![Medium::WifiLan.into()],
+                    mediums: upgrade_mediums(),
                     ..Default::default()
                 }),
                 ..Default::default()
@@ -554,6 +554,12 @@ impl OutboundRequest {
                         )
                     }
                 }
+            }
+            location_nearby_connections::v1_frame::FrameType::BandwidthUpgradeNegotiation => {
+                info!(
+                    "Bandwidth upgrade negotiation: {:?}",
+                    v1_frame.bandwidth_upgrade_negotiation
+                );
             }
             location_nearby_connections::v1_frame::FrameType::KeepAlive => {
                 trace!("Sending keepalive");
@@ -1451,4 +1457,24 @@ impl OutboundRequest {
         // get spammed by new requests. Currently set to 10 micro secs.
         tokio::time::sleep(SANITY_DURATION).await;
     }
+}
+
+/// Mediums we tell the receiver it may upgrade the connection to.
+///
+/// `RQS_UPGRADE_MEDIUMS` (comma-separated, e.g. `hotspot,direct`) adds more,
+/// to observe what a receiver offers; they are not supported yet.
+fn upgrade_mediums() -> Vec<i32> {
+    let mut mediums = vec![Medium::WifiLan];
+    for name in std::env::var("RQS_UPGRADE_MEDIUMS")
+        .unwrap_or_default()
+        .split(',')
+    {
+        match name.trim() {
+            "hotspot" => mediums.push(Medium::WifiHotspot),
+            "direct" => mediums.push(Medium::WifiDirect),
+            "" => {}
+            other => warn!("RQS_UPGRADE_MEDIUMS: unknown medium {other:?}"),
+        }
+    }
+    mediums.into_iter().map(Into::into).collect()
 }

@@ -236,6 +236,12 @@ impl InboundRequest {
             .as_ref()
             .ok_or_else(|| anyhow!("Missing required fields"))?;
 
+        info!(
+            "Remote supports upgrade mediums {:?}, medium metadata {:?}",
+            connection_request.mediums().collect::<Vec<_>>(),
+            connection_request.medium_metadata
+        );
+
         let endpoint_info = connection_request
             .endpoint_info
             .as_ref()
@@ -740,6 +746,12 @@ impl InboundRequest {
                         )
                     }
                 }
+            }
+            location_nearby_connections::v1_frame::FrameType::BandwidthUpgradeNegotiation => {
+                info!(
+                    "Bandwidth upgrade negotiation: {:?}",
+                    v1_frame.bandwidth_upgrade_negotiation
+                );
             }
             location_nearby_connections::v1_frame::FrameType::KeepAlive => {
                 trace!("Sending keepalive");
