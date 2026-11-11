@@ -14,6 +14,8 @@ pub use ble::*;
 #[cfg(all(feature = "experimental", target_os = "linux"))]
 mod blea;
 #[cfg(all(feature = "experimental", target_os = "linux"))]
+pub mod bluetooth;
+#[cfg(all(feature = "experimental", target_os = "linux"))]
 pub use blea::*;
 mod inbound;
 pub use inbound::*;

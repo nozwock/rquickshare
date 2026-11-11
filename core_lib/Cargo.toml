@@ -9,8 +9,13 @@ authors = ["martichou"]
 name = "core_bin"
 path = "src/bin.rs"
 
+[[example]]
+name = "bt_send"
+required-features = ["experimental"]
+
 [target.'cfg(target_os = "linux")'.dependencies]
 bluer = { version = "0.17", features = ["full"], optional = true }
+libc = "0.2"
 
 [target.'cfg(all(target_arch = "aarch64", target_os = "linux"))'.dependencies]
 dbus = { version = "0.9", features = ["vendored"] }
@@ -27,6 +32,7 @@ hex = "0.4"
 hkdf = "0.12"
 hmac = "0.12"
 libaes = "0.7"
+md-5 = "0.10"
 log = "0.4"
 mdns-sd = { git = "https://github.com/Martichou/mdns-sd", branch = "unsolicited" }
 mime_guess = "2.0"

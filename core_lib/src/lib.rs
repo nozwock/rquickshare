@@ -152,6 +152,13 @@ impl RQS {
             self.message_sender.clone(),
             send_channel.1,
         )?;
+        #[cfg(all(feature = "experimental", target_os = "linux"))]
+        {
+            match hdl::bluetooth::BluetoothServer::new().await {
+                Ok(bt) => server.set_bluetooth(bt),
+                Err(err) => warn!("BluetoothServer: {}", err),
+            }
+        }
         let ctk = ctoken.clone();
         tracker.spawn(async move { server.run(ctk).await });
 
