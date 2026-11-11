@@ -219,6 +219,22 @@ impl RQS {
             });
         }
 
+        #[cfg(all(feature = "experimental", target_os = "linux"))]
+        {
+            let sender = sender.clone();
+            let ctk_ble = ctk.clone();
+            tracker.spawn(async move {
+                match hdl::BleDiscovery::new(sender).await {
+                    Ok(discovery) => {
+                        if let Err(e) = discovery.run(ctk_ble).await {
+                            error!("BleDiscovery: {}", e);
+                        }
+                    }
+                    Err(e) => warn!("Couldn't init BleDiscovery: {}", e),
+                }
+            });
+        }
+
         let discovery = MDnsDiscovery::new(sender)?;
         tracker.spawn(async move { discovery.run(ctk.clone()).await });
 

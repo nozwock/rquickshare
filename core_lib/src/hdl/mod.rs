@@ -12,7 +12,11 @@ mod ble;
 #[cfg(feature = "experimental")]
 pub use ble::*;
 #[cfg(all(feature = "experimental", target_os = "linux"))]
+mod ble_discovery;
+#[cfg(all(feature = "experimental", target_os = "linux"))]
 mod blea;
+#[cfg(all(feature = "experimental", target_os = "linux"))]
+pub use ble_discovery::BleDiscovery;
 #[cfg(all(feature = "experimental", target_os = "linux"))]
 pub mod bluetooth;
 #[cfg(all(feature = "experimental", target_os = "linux"))]

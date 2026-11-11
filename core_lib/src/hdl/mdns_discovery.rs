@@ -5,8 +5,8 @@ use tokio::net::TcpStream;
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 
-use crate::utils::{is_not_self_ip, parse_mdns_endpoint_info};
 use crate::DeviceType;
+use crate::utils::{is_not_self_ip, parse_mdns_endpoint_info};
 
 #[derive(Debug, Clone, Default)]
 pub struct EndpointInfo {
@@ -17,6 +17,19 @@ pub struct EndpointInfo {
     pub port: Option<String>,
     pub rtype: Option<DeviceType>,
     pub present: Option<bool>,
+    /// Bluetooth Classic address, for endpoints discovered over BLE.
+    pub bluetooth_address: Option<String>,
+}
+
+impl EndpointInfo {
+    /// Address to put in [`SendInfo::addr`](crate::SendInfo::addr): the
+    /// Bluetooth address when known, otherwise `ip:port`.
+    pub fn send_address(&self) -> Option<String> {
+        if let Some(addr) = &self.bluetooth_address {
+            return Some(addr.clone());
+        }
+        Some(format!("{}:{}", self.ip.as_ref()?, self.port.as_ref()?))
+    }
 }
 
 pub struct MDnsDiscovery {
@@ -91,6 +104,7 @@ impl MDnsDiscovery {
                                             port: Some(port.to_string()),
                                             rtype: Some(dt),
                                             present: Some(true),
+                                            bluetooth_address: None,
                                         };
                                         info!("ServiceResolved: Resolved a new service: {:?}", ei);
                                         cache.insert(fullname.clone(), ei.clone());

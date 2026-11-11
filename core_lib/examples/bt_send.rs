@@ -1,14 +1,17 @@
 //! Send text to a Quick Share device over Bluetooth RFCOMM.
 //!
 //!     cargo run --example bt_send -- AA:BB:CC:DD:EE:FF "hello"
+//!     cargo run --example bt_send -- discover "hello"
 //!
-//! The receiver must be in Quick Share's receiving mode (visible). Its
-//! Bluetooth address is under Settings > About phone on Android.
+//! The receiver must be in Quick Share's receiving mode and visible to
+//! everyone. With `discover`, the first receiver found over BLE is used;
+//! otherwise pass its Bluetooth Classic address.
 
 use std::time::Duration;
 
 use rqs_lib::channel::Message;
 use rqs_lib::{OutboundPayload, RQS, SendInfo, TextPayloadType, TransferState, Visibility};
+use tokio::sync::broadcast;
 use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
@@ -21,21 +24,44 @@ async fn main() -> Result<(), anyhow::Error> {
         .init();
 
     let mut args = std::env::args().skip(1);
-    let (Some(addr), Some(text)) = (args.next(), args.next()) else {
-        anyhow::bail!("usage: bt_send <BLUETOOTH_ADDRESS> <TEXT>");
+    let (Some(target), Some(text)) = (args.next(), args.next()) else {
+        anyhow::bail!("usage: bt_send <BLUETOOTH_ADDRESS|discover> <TEXT>");
     };
-    anyhow::ensure!(
-        rqs_lib::hdl::bluetooth::parse_address(&addr).is_some(),
-        "{addr} is not a Bluetooth address"
-    );
 
     let mut rqs = RQS::new(Visibility::Invisible, None, None, None);
     let (send, _) = rqs.run().await?;
     let mut events = rqs.message_sender.subscribe();
 
+    let (addr, name) = if target == "discover" {
+        let (tx, mut found) = broadcast::channel(16);
+        rqs.discovery(tx)?;
+        println!("discovering over BLE...");
+        let endpoint = tokio::time::timeout(Duration::from_secs(120), async {
+            loop {
+                let e = found.recv().await?;
+                println!("found: {:?} {:?} {:?}", e.name, e.rtype, e.send_address());
+                if e.bluetooth_address.is_some() {
+                    return Ok::<_, anyhow::Error>(e);
+                }
+            }
+        })
+        .await
+        .map_err(|_| anyhow::anyhow!("no receiver found over BLE"))??;
+        rqs.stop_discovery();
+        let addr = endpoint.send_address().unwrap();
+        (addr.clone(), endpoint.name.unwrap_or(addr))
+    } else {
+        anyhow::ensure!(
+            rqs_lib::hdl::bluetooth::parse_address(&target).is_some(),
+            "{target} is not a Bluetooth address"
+        );
+        (target.clone(), target)
+    };
+    println!("sending to {name} ({addr})");
+
     send.send(SendInfo {
         id: addr.clone(),
-        name: addr.clone(),
+        name,
         addr: addr.clone(),
         ob: OutboundPayload::Text {
             text,

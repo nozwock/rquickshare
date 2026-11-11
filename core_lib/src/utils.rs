@@ -101,20 +101,30 @@ pub fn gen_mdns_endpoint_info(device_type: u8, device_name: &str) -> String {
 
 pub fn parse_mdns_endpoint_info(encoded_str: &str) -> Result<(DeviceType, String), anyhow::Error> {
     let decoded_bytes = URL_SAFE_NO_PAD.decode(encoded_str)?;
-    if decoded_bytes.len() < 19 {
+    match parse_endpoint_info(&decoded_bytes)? {
+        (device_type, Some(name)) => Ok((device_type, name)),
+        (_, None) => Err(anyhow!("Invalid data length")),
+    }
+}
+
+/// Device type and, when the endpoint is visible to everyone, its name from
+/// Quick Share endpoint info:
+/// `[version|visibility|device type][salt(2)][key hash(14)][name len][name]`.
+pub fn parse_endpoint_info(info: &[u8]) -> Result<(DeviceType, Option<String>), anyhow::Error> {
+    if info.len() < 17 {
         return Err(anyhow!("Invalid data length"));
     }
+    let device_type = DeviceType::from_raw_value((info[0] >> 1) & 0x7);
 
-    let device_type = (decoded_bytes[0] >> 1) & 0x7;
-    let name_length = decoded_bytes[17] as usize;
-    if 18 + name_length > decoded_bytes.len() {
-        return Err(anyhow!("Invalid name length"));
-    }
+    // Contacts-only endpoints carry no name.
+    let Some(&name_length) = info.get(17) else {
+        return Ok((device_type, None));
+    };
+    let name = info
+        .get(18..18 + name_length as usize)
+        .ok_or_else(|| anyhow!("Invalid name length"))?;
 
-    let device_name_bytes = &decoded_bytes[18..18 + name_length];
-    let device_name = String::from_utf8(device_name_bytes.to_vec())?;
-
-    Ok((DeviceType::from_raw_value(device_type), device_name))
+    Ok((device_type, Some(String::from_utf8(name.to_vec())?)))
 }
 
 pub async fn stream_read_exact(
