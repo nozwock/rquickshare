@@ -245,6 +245,12 @@ pub(crate) async fn connect_upgrade_path(
 pub(crate) struct WifiConnection {
     /// Takes the connection down when dropped.
     _activation: nm::Activation,
+    /// Whether we host the network (an access point).
+    #[cfg_attr(
+        not(all(feature = "experimental", target_os = "linux")),
+        allow(dead_code)
+    )]
+    host: bool,
 }
 
 impl WifiConnection {
@@ -303,6 +309,7 @@ impl WifiConnection {
         info!("bwu: {name} up after {:?}", started.elapsed());
         Ok(Self {
             _activation: activation,
+            host,
         })
     }
 }
@@ -490,6 +497,18 @@ impl Drop for WifiConnection {
     fn drop(&mut self) {
         // Dropping the activation afterwards takes the network down.
         info!("bwu: leaving the upgrade network");
+        #[cfg(all(feature = "experimental", target_os = "linux"))]
+        if self.host {
+            if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+                runtime.spawn(async {
+                    // Let NetworkManager take the access point down first.
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                    if let Err(err) = super::bluetooth::revive_scanning().await {
+                        warn!("bwu: checking Bluetooth scanning: {err}");
+                    }
+                });
+            }
+        }
     }
 }
 

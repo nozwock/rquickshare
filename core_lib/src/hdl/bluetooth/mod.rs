@@ -165,6 +165,54 @@ pub async fn connect(addr: Address) -> Result<Transport, anyhow::Error> {
     Ok(Transport::new(Medium::Bluetooth, stream))
 }
 
+/// How long [`revive_scanning`] listens for any sign of a scan.
+const SCAN_PROBE: Duration = Duration::from_secs(6);
+
+/// Brings LE scanning back if hosting a Wi-Fi access point stopped it.
+///
+/// On Intel AX211 (Wi-Fi and Bluetooth on one chip, Linux 6.1) the
+/// controller stops reporting advertisements some seconds into AP mode and
+/// doesn't recover after it, while BlueZ keeps saying it is discovering: we
+/// would no longer find anyone to send to. Only powering the adapter off and
+/// on helps, so do that, but only if a short scan really sees nothing, since
+/// it also drops other Bluetooth connections.
+pub(crate) async fn revive_scanning() -> Result<(), anyhow::Error> {
+    let session = Session::new().await?;
+    let adapter = session.default_adapter().await?;
+    if !adapter.is_powered().await? || scanning_works(&adapter).await? {
+        return Ok(());
+    }
+    warn!(
+        "{INNER_NAME}: scanning stopped while hosting a hotspot, power-cycling {}",
+        adapter.name()
+    );
+    adapter.set_powered(false).await?;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    adapter.set_powered(true).await?;
+    Ok(())
+}
+
+/// Whether a short discovery hears from any device. The stream starts with
+/// every device BlueZ already knows about; only events beyond those come
+/// from the radio (new devices or property changes such as RSSI).
+async fn scanning_works(adapter: &bluer::Adapter) -> Result<bool, anyhow::Error> {
+    let known = adapter.device_addresses().await?.len();
+    let events = adapter.discover_devices_with_changes().await?;
+    let mut events = std::pin::pin!(events);
+    let mut seen = 0;
+    let _ = tokio::time::timeout(SCAN_PROBE, async {
+        while events.next().await.is_some() {
+            seen += 1;
+            if seen > known {
+                break;
+            }
+        }
+    })
+    .await;
+    debug!("{INNER_NAME}: scan probe: {seen} events, {known} devices known");
+    Ok(seen > known)
+}
+
 #[cfg(test)]
 mod tests {
     use sha2::Sha256;
