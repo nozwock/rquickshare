@@ -21,8 +21,8 @@ use bluer::adv::{Advertisement, AdvertisementHandle, Type};
 use bluer::gatt::local::{
     Application, ApplicationHandle, Characteristic, CharacteristicRead, Service,
 };
-use bluer::{Adapter, Session};
-use futures::FutureExt;
+use bluer::{Adapter, AdapterEvent, AdapterProperty, Session};
+use futures::{FutureExt, StreamExt};
 use rand::Rng;
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
@@ -84,6 +84,7 @@ impl NearbyAdvertiser {
     pub async fn run(mut self, ctk: CancellationToken) -> Result<(), anyhow::Error> {
         info!("{INNER_NAME}: service starting");
         let mut active: Option<Active> = None;
+        let mut events = self.adapter.events().await?;
 
         loop {
             let visible = *self.visibility.borrow_and_update() != Visibility::Invisible;
@@ -106,6 +107,18 @@ impl NearbyAdvertiser {
                         break;
                     }
                 }
+                event = events.next() => match event {
+                    // BlueZ drops advertisements while the adapter is off
+                    // and doesn't bring them back: register them again.
+                    Some(AdapterEvent::PropertyChanged(AdapterProperty::Powered(true))) => {
+                        if active.is_some() {
+                            info!("{INNER_NAME}: adapter powered on again, re-advertising");
+                            self.stop(active.take()).await;
+                        }
+                    }
+                    Some(_) => {}
+                    None => break,
+                },
             }
         }
 
