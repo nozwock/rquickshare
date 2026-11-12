@@ -17,6 +17,10 @@ required-features = ["experimental"]
 name = "bt_receive"
 required-features = ["experimental"]
 
+[[example]]
+name = "bt_discover"
+required-features = ["experimental"]
+
 [target.'cfg(target_os = "linux")'.dependencies]
 bluer = { version = "0.17", features = ["full"], optional = true }
 dbus = "0.9"
