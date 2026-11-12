@@ -235,7 +235,7 @@ mod tests {
 
     #[test]
     fn distinguishes_bluetooth_from_ip_addresses() {
-        assert!(parse_address("E4:0D:36:CE:AE:AE").is_some());
+        assert!(parse_address("02:00:00:00:00:AA").is_some());
         assert!(parse_address("192.168.1.10:41234").is_none());
         assert!(parse_address("[fe80::1]:41234").is_none());
     }

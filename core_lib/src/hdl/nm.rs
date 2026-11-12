@@ -17,6 +17,8 @@ pub(crate) const CAP_AP: u32 = 0x40;
 pub(crate) const CAP_FREQ_5GHZ: u32 = 0x400;
 
 #[derive(Debug, Clone)]
+// Only the Linux implementation reads the fields.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub(crate) struct WifiDevice {
     /// D-Bus object path.
     pub path: String,
@@ -27,6 +29,8 @@ pub(crate) struct WifiDevice {
 
 /// A Wi-Fi network to join or host.
 #[derive(Debug, Clone)]
+// Only the Linux implementation reads the fields.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub(crate) struct WifiProfile {
     pub name: String,
     pub ssid: String,

@@ -52,10 +52,9 @@ async fn main() -> Result<(), anyhow::Error> {
                         "  from {:?}, PIN {:?}, {:?}",
                         meta.source.as_ref().map(|s| &s.name),
                         meta.pin_code,
-                        meta.payload_preview.as_ref().unwrap_or(&format!(
-                            "{} bytes",
-                            meta.total_bytes
-                        ))
+                        meta.payload_preview
+                            .as_ref()
+                            .unwrap_or(&format!("{} bytes", meta.total_bytes))
                     );
                 }
                 let _ = sender.send(ChannelMessage {

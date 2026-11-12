@@ -159,7 +159,7 @@ mod tests {
 
     #[test]
     fn bdaddr_is_little_endian() {
-        let addr: Address = "E4:0D:36:CE:AE:01".parse().unwrap();
-        assert_eq!(bdaddr(addr), [0x01, 0xae, 0xce, 0x36, 0x0d, 0xe4]);
+        let addr: Address = "12:34:56:78:9A:BC".parse().unwrap();
+        assert_eq!(bdaddr(addr), [0xbc, 0x9a, 0x78, 0x56, 0x34, 0x12]);
     }
 }

@@ -98,7 +98,7 @@ enum Upgrade {
     /// Joining the network the receiver offered.
     Connecting {
         result: oneshot::Receiver<Result<Upgraded, anyhow::Error>>,
-        info: UpgradePathInfo,
+        info: Box<UpgradePathInfo>,
         /// The receiver already sent its last write on the old channel.
         peer_last_write: bool,
     },
@@ -1525,7 +1525,7 @@ impl OutboundRequest {
                 });
                 self.upgrade = Upgrade::Connecting {
                     result,
-                    info,
+                    info: Box::new(info),
                     peer_last_write: false,
                 };
             }
@@ -1604,7 +1604,7 @@ impl OutboundRequest {
             Err(err) => {
                 warn!("bwu: couldn't upgrade to {:?}: {err:#}", info.medium());
                 self.encrypt_and_send(&bwu::negotiation(BwuEvent::UpgradeFailure, |f| {
-                    f.upgrade_path_info = Some(info);
+                    f.upgrade_path_info = Some(*info);
                 }))
                 .await?;
                 self.upgrade = Upgrade::Failed;

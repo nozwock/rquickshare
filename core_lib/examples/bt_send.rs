@@ -56,6 +56,8 @@ async fn main() -> Result<(), anyhow::Error> {
         let addr = endpoint.bluetooth_address.clone().unwrap();
         (addr.clone(), endpoint.name.unwrap_or(addr))
     } else {
+        // The Bluetooth medium only exists on Linux.
+        #[cfg(target_os = "linux")]
         anyhow::ensure!(
             rqs_lib::hdl::bluetooth::parse_address(&target).is_some(),
             "{target} is not a Bluetooth address"
