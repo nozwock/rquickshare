@@ -30,7 +30,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
-use super::Transport;
+use super::{Transport, nm};
 use crate::location_nearby_connections::bandwidth_upgrade_negotiation_frame::upgrade_path_info::Medium;
 use crate::location_nearby_connections::bandwidth_upgrade_negotiation_frame::upgrade_path_info::WifiHotspotCredentials;
 use crate::location_nearby_connections::bandwidth_upgrade_negotiation_frame::{
@@ -243,115 +243,67 @@ pub(crate) async fn connect_upgrade_path(
 /// lets NetworkManager reconnect to the previous network).
 #[derive(Debug)]
 pub(crate) struct WifiConnection {
-    name: String,
+    /// Takes the connection down when dropped.
+    _activation: nm::Activation,
 }
 
 impl WifiConnection {
     /// Joins a network. `frequency` (MHz, -1 if unknown) narrows the probe
     /// to one channel.
     pub async fn join(ssid: &str, password: &str, frequency: i32) -> Result<Self, anyhow::Error> {
-        let device = wifi_device().await?;
-        let mut settings = vec![
-            "ssid",
+        let device = nm::wifi_device().await?;
+        info!(
+            "bwu: joining {ssid:?} ({frequency} MHz) on {}",
+            device.interface
+        );
+        Self::activate(
+            &device,
+            nm::UPGRADE_PREFIX,
             ssid,
-            "wifi-sec.key-mgmt",
-            "wpa-psk",
-            "wifi-sec.psk",
             password,
-            // Probe for the SSID directly instead of waiting for a scan.
-            "802-11-wireless.hidden",
-            "yes",
-            "ipv4.never-default",
-            "yes",
-        ];
-        let channel = channel_settings(frequency);
-        settings.extend(channel.iter().map(String::as_str));
-
-        info!("bwu: joining {ssid:?} ({frequency} MHz) on {device}");
-        Self::activate(&device, "rqs-upgrade", &settings).await
+            false,
+            frequency,
+        )
+        .await
     }
 
     /// Hosts a WPA2 access point that hands out addresses (NetworkManager's
     /// "shared" mode).
     pub async fn host(
-        device: &str,
+        device: &nm::WifiDevice,
         ssid: &str,
         password: &str,
         frequency: i32,
     ) -> Result<Self, anyhow::Error> {
-        let mut settings = vec![
-            "ssid",
-            ssid,
-            "802-11-wireless.mode",
-            "ap",
-            "wifi-sec.key-mgmt",
-            "wpa-psk",
-            "wifi-sec.psk",
-            password,
-            "wifi-sec.proto",
-            "rsn",
-            "wifi-sec.pairwise",
-            "ccmp",
-            "wifi-sec.group",
-            "ccmp",
-            "ipv4.method",
-            "shared",
-        ];
-        let channel = channel_settings(frequency);
-        settings.extend(channel.iter().map(String::as_str));
-
-        info!("bwu: hosting {ssid:?} ({frequency} MHz) on {device}");
-        Self::activate(device, "rqs-hotspot", &settings).await
+        info!(
+            "bwu: hosting {ssid:?} ({frequency} MHz) on {}",
+            device.interface
+        );
+        Self::activate(device, nm::HOTSPOT_PREFIX, ssid, password, true, frequency).await
     }
 
     async fn activate(
-        device: &str,
+        device: &nm::WifiDevice,
         prefix: &str,
-        settings: &[&str],
+        ssid: &str,
+        password: &str,
+        host: bool,
+        frequency: i32,
     ) -> Result<Self, anyhow::Error> {
-        let name = format!("{prefix}-{}", hex::encode(rand::random::<[u8; 4]>()));
-        let user = std::env::var("USER").unwrap_or_default();
-        let permissions = format!("user:{user}");
-
-        let mut add = vec![
-            "connection",
-            "add",
-            "type",
-            "wifi",
-            "ifname",
-            device,
-            "con-name",
-            &name,
-            "ipv6.method",
-            "ignore",
-            "connection.autoconnect",
-            "no",
-        ];
-        if !user.is_empty() {
-            // Owned by us: needs no authorization.
-            add.extend(["connection.permissions", &permissions]);
-        }
-        add.extend(settings);
-        nmcli(&add).await?;
-        let connection = Self { name };
-
+        let name = format!("{prefix}{}", hex::encode(rand::random::<[u8; 4]>()));
+        let profile = nm::WifiProfile {
+            name: name.clone(),
+            ssid: ssid.to_owned(),
+            password: password.to_owned(),
+            host,
+            channel: channel_of(frequency),
+        };
         let started = std::time::Instant::now();
-        nmcli(&["--wait", "30", "connection", "up", &connection.name]).await?;
-        info!("bwu: {} up after {:?}", connection.name, started.elapsed());
-        Ok(connection)
-    }
-}
-
-/// NetworkManager settings pinning `frequency` (MHz), if it is known.
-fn channel_settings(frequency: i32) -> Vec<String> {
-    match channel_of(frequency) {
-        Some((band, channel)) => vec![
-            "802-11-wireless.band".into(),
-            band.into(),
-            "802-11-wireless.channel".into(),
-            channel.to_string(),
-        ],
-        None => Vec::new(),
+        let activation = nm::activate(device, profile).await?;
+        info!("bwu: {name} up after {:?}", started.elapsed());
+        Ok(Self {
+            _activation: activation,
+        })
     }
 }
 
@@ -367,8 +319,16 @@ impl Hotspot {
     /// Starts a hotspot on a channel both sides can use, preferring 5 GHz.
     /// `peer` is the medium metadata from the sender's connection request.
     pub async fn start(peer: Option<&MediumMetadata>) -> Result<Self, anyhow::Error> {
-        let device = wifi_device().await?;
-        let ours = ap_frequencies(&iw_list().await);
+        let device = nm::wifi_device().await?;
+        ensure!(
+            device.capabilities & nm::CAP_AP != 0,
+            "{} can't host an access point",
+            device.interface
+        );
+        let mut ours = ap_frequencies(&iw_list().await);
+        if ours.is_empty() {
+            ours = fallback_frequencies(device.capabilities);
+        }
         let theirs: Vec<i32> = peer
             .and_then(|m| {
                 m.wifi_hotspot_sta_usable_channels
@@ -401,12 +361,8 @@ impl Hotspot {
 
         let gateway = tokio::time::timeout(CONNECT_TIMEOUT, async {
             loop {
-                if let Ok(out) = nmcli(&["-g", "IP4.ADDRESS", "device", "show", &device]).await {
-                    if let Some(ip) = out.lines().next().and_then(|l| l.split('/').next()) {
-                        if let Ok(ip) = ip.trim().parse::<std::net::Ipv4Addr>() {
-                            return ip;
-                        }
-                    }
+                if let Some(ip) = nm::ipv4_address(&device).await {
+                    return ip;
                 }
                 tokio::time::sleep(Duration::from_millis(200)).await;
             }
@@ -532,44 +488,45 @@ fn ap_frequencies(iw_list: &str) -> Vec<i32> {
 
 impl Drop for WifiConnection {
     fn drop(&mut self) {
+        // Dropping the activation afterwards takes the network down.
         info!("bwu: leaving the upgrade network");
-        let _ = std::process::Command::new("nmcli")
-            .args(["connection", "delete", &self.name])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status();
     }
 }
 
 /// NetworkManager band and channel number for a frequency in MHz.
-fn channel_of(frequency: i32) -> Option<(&'static str, i32)> {
+fn channel_of(frequency: i32) -> Option<(&'static str, u32)> {
+    let channel = |base: i32| u32::try_from((frequency - base) / 5).ok();
     match frequency {
         2484 => Some(("bg", 14)),
-        2412..=2472 => Some(("bg", (frequency - 2407) / 5)),
-        5160..=5885 => Some(("a", (frequency - 5000) / 5)),
+        2412..=2472 => Some(("bg", channel(2407)?)),
+        5160..=5885 => Some(("a", channel(5000)?)),
         _ => None,
     }
+}
+
+/// Frequencies (MHz) to assume when `iw` can't tell us (it's missing, or
+/// we're in a sandbox): 2.4 GHz channels 1-11 and, if supported, the 5 GHz
+/// channels most countries allow without radar detection (36-48, 149-165).
+fn fallback_frequencies(capabilities: u32) -> Vec<i32> {
+    let mut frequencies: Vec<i32> = (2412..=2462).step_by(5).collect();
+    if capabilities & nm::CAP_FREQ_5GHZ != 0 {
+        frequencies.extend([5180, 5200, 5220, 5240, 5745, 5765, 5785, 5805, 5825]);
+    }
+    frequencies
 }
 
 /// What the receiver needs to pick an upgrade network we can join: like
 /// Android, the bands we support, the access point we are on (so it can
 /// share its channel) and the frequencies we can use. `None` without Wi-Fi.
 pub(crate) async fn local_medium_metadata() -> Option<MediumMetadata> {
-    let device = wifi_device().await.ok()?;
+    let device = nm::wifi_device().await.ok()?;
 
-    let frequencies = usable_frequencies(&iw_list().await);
-    let props = nmcli(&[
-        "-t",
-        "-f",
-        "WIFI-PROPERTIES.5GHZ",
-        "device",
-        "show",
-        &device,
-    ])
-    .await
-    .unwrap_or_default();
-    let supports_5_ghz =
-        props.contains(":yes") || frequencies.iter().any(|f| (5000..5925).contains(f));
+    let mut frequencies = usable_frequencies(&iw_list().await);
+    if frequencies.is_empty() {
+        frequencies = fallback_frequencies(device.capabilities);
+    }
+    let supports_5_ghz = device.capabilities & nm::CAP_FREQ_5GHZ != 0
+        || frequencies.iter().any(|f| (5000..5925).contains(f));
     let supports_6_ghz = frequencies.iter().any(|f| *f >= 5925);
 
     let mut metadata = MediumMetadata {
@@ -578,35 +535,19 @@ pub(crate) async fn local_medium_metadata() -> Option<MediumMetadata> {
         mobile_radio: Some(false),
         ..Default::default()
     };
-    let aps = nmcli(&[
-        "-t",
-        "-f",
-        "ACTIVE,BSSID,FREQ",
-        "device",
-        "wifi",
-        "list",
-        "ifname",
-        &device,
-        "--rescan",
-        "no",
-    ])
-    .await
-    .unwrap_or_default();
-    if let Some((bssid, freq)) = aps.lines().find_map(parse_active_ap) {
+    if let Some((bssid, frequency)) = nm::active_access_point(&device).await {
         metadata.bssid = Some(bssid);
-        metadata.ap_frequency = Some(freq);
+        metadata.ap_frequency = Some(frequency);
     }
-    if !frequencies.is_empty() {
-        metadata.available_channels = Some(AvailableChannels {
-            channels: frequencies.clone(),
-        });
-        metadata.wifi_direct_cli_usable_channels = Some(WifiDirectCliUsableChannels {
-            channels: frequencies.clone(),
-        });
-        metadata.wifi_hotspot_sta_usable_channels = Some(WifiHotspotStaUsableChannels {
-            channels: frequencies,
-        });
-    }
+    metadata.available_channels = Some(AvailableChannels {
+        channels: frequencies.clone(),
+    });
+    metadata.wifi_direct_cli_usable_channels = Some(WifiDirectCliUsableChannels {
+        channels: frequencies.clone(),
+    });
+    metadata.wifi_hotspot_sta_usable_channels = Some(WifiHotspotStaUsableChannels {
+        channels: frequencies,
+    });
     Some(metadata)
 }
 
@@ -621,39 +562,6 @@ fn usable_frequencies(iw_list: &str) -> Vec<i32> {
     frequencies.sort_unstable();
     frequencies.dedup();
     frequencies
-}
-
-/// `yes:AA\:BB\:..:5240 MHz` -> (`AA:BB:..`, 5240).
-fn parse_active_ap(line: &str) -> Option<(String, i32)> {
-    let rest = line.strip_prefix("yes:")?;
-    let (bssid, freq) = rest.rsplit_once(':')?;
-    let freq = freq.trim_end_matches(" MHz").parse().ok()?;
-    Some((bssid.replace("\\:", ":"), freq))
-}
-
-async fn wifi_device() -> Result<String, anyhow::Error> {
-    let out = nmcli(&["-t", "-f", "DEVICE,TYPE", "device"]).await?;
-    out.lines()
-        .filter_map(|l| l.split_once(':'))
-        .find(|(_, ty)| *ty == "wifi")
-        .map(|(dev, _)| dev.replace("\\:", ":"))
-        .ok_or_else(|| anyhow!("no Wi-Fi device"))
-}
-
-async fn nmcli(args: &[&str]) -> Result<String, anyhow::Error> {
-    let out = tokio::process::Command::new("nmcli")
-        .args(args)
-        .output()
-        .await
-        .map_err(|e| anyhow!("running nmcli: {e}"))?;
-    if !out.status.success() {
-        bail!(
-            "nmcli {}: {}",
-            args.first().copied().unwrap_or_default(),
-            String::from_utf8_lossy(&out.stderr).trim()
-        );
-    }
-    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
 #[cfg(test)]
@@ -692,11 +600,40 @@ mod tests {
     }
 
     #[test]
-    fn parses_active_ap() {
-        assert_eq!(
-            parse_active_ap("yes:30\\:01\\:AF\\:9E\\:3D\\:2C:5240 MHz"),
-            Some(("30:01:AF:9E:3D:2C".into(), 5240))
-        );
-        assert_eq!(parse_active_ap("no:30\\:01:2412 MHz"), None);
+    fn fallback_frequencies_follow_capabilities() {
+        assert_eq!(fallback_frequencies(0).len(), 11);
+        assert!(fallback_frequencies(nm::CAP_FREQ_5GHZ).contains(&5180));
+    }
+}
+
+#[cfg(test)]
+mod nm_smoke {
+    /// Talks to the real NetworkManager; run with `--ignored`.
+    #[test]
+    #[ignore]
+    fn reads_wifi_device_and_hosts() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let device = super::nm::wifi_device().await.unwrap();
+            println!("device {device:?}");
+            println!("metadata {:?}", super::local_medium_metadata().await);
+            let wifi =
+                super::WifiConnection::host(&device, "DIRECT-rqs-smoke", "smoketest1234", 5180)
+                    .await
+                    .unwrap();
+            println!(
+                "hosting {wifi:?}, gateway {:?}",
+                super::nm::ipv4_address(&device).await
+            );
+            let hold = std::env::var("RQS_SMOKE_HOLD")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0);
+            tokio::time::sleep(std::time::Duration::from_secs(hold)).await;
+            drop(wifi);
+            // Give the Bluetooth scan check a chance to run.
+            tokio::time::sleep(std::time::Duration::from_secs(12)).await;
+            println!("done");
+        });
     }
 }

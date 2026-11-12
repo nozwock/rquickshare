@@ -28,6 +28,7 @@ pub use nearby_advertiser::NearbyAdvertiser;
 pub(crate) mod bwu;
 pub(crate) mod endpoint_merge;
 mod inbound;
+mod nm;
 pub use inbound::*;
 pub mod info;
 mod mdns_discovery;
