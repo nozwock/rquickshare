@@ -50,9 +50,12 @@ struct SavedDiscoverable {
 /// Something that is active only while we are visible.
 struct Active {
     // Dropping these unregisters them.
-    advertisement: AdvertisementHandle,
+    /// `None` while paused for discovery.
+    advertisement: Option<AdvertisementHandle>,
     gatt: ApplicationHandle,
     saved: Option<SavedDiscoverable>,
+    /// Service data to advertise.
+    header: Vec<u8>,
 }
 
 pub struct NearbyAdvertiser {
@@ -61,6 +64,7 @@ pub struct NearbyAdvertiser {
     endpoint_id: [u8; 4],
     device_name: &'static RwLock<String>,
     visibility: watch::Receiver<Visibility>,
+    discovering: watch::Receiver<bool>,
 }
 
 impl NearbyAdvertiser {
@@ -68,6 +72,7 @@ impl NearbyAdvertiser {
         endpoint_id: [u8; 4],
         device_name: &'static RwLock<String>,
         visibility: watch::Receiver<Visibility>,
+        discovering: watch::Receiver<bool>,
     ) -> Result<Self, anyhow::Error> {
         let session = Session::new().await?;
         let adapter = session.default_adapter().await?;
@@ -78,6 +83,7 @@ impl NearbyAdvertiser {
             endpoint_id,
             device_name,
             visibility,
+            discovering,
         })
     }
 
@@ -96,6 +102,28 @@ impl NearbyAdvertiser {
                 (false, true) => self.stop(active.take()).await,
                 _ => {}
             }
+            // While we look for receivers, leave the air to the beacon that
+            // wakes them up (BleAdvertiser): the controller takes turns
+            // between advertisements, and Android scans in short windows.
+            // Discoverability stays on, so toggling it can't run into the
+            // BlueZ issue described in `start`.
+            let discovering = *self.discovering.borrow_and_update();
+            if let Some(a) = active.as_mut() {
+                match (discovering, a.advertisement.is_some()) {
+                    (true, true) => {
+                        a.advertisement = None;
+                        info!("{INNER_NAME}: paused while discovering");
+                    }
+                    (false, false) => match self.advertise(&a.header).await {
+                        Ok(handle) => {
+                            a.advertisement = Some(handle);
+                            info!("{INNER_NAME}: resumed");
+                        }
+                        Err(err) => warn!("{INNER_NAME}: couldn't resume advertising: {err}"),
+                    },
+                    _ => {}
+                }
+            }
 
             tokio::select! {
                 _ = ctk.cancelled() => {
@@ -103,6 +131,11 @@ impl NearbyAdvertiser {
                     break;
                 }
                 r = self.visibility.changed() => {
+                    if r.is_err() {
+                        break;
+                    }
+                }
+                r = self.discovering.changed() => {
                     if r.is_err() {
                         break;
                     }
@@ -149,24 +182,13 @@ impl NearbyAdvertiser {
             }
         };
 
+        let header = adv::build_header(SERVICE_ID, &data).into_bytes();
         let served = async {
             let gatt = self
                 .adapter
                 .serve_gatt_application(advertisement_server(data.clone()))
                 .await?;
-            let advertisement = self
-                .adapter
-                .advertise(Advertisement {
-                    // Connectable, so scanners can read the GATT characteristic.
-                    advertisement_type: Type::Peripheral,
-                    service_data: [(
-                        NEARBY_SERVICE_UUID,
-                        adv::build_header(SERVICE_ID, &data).into_bytes(),
-                    )]
-                    .into(),
-                    ..Default::default()
-                })
-                .await?;
+            let advertisement = self.advertise(&header).await?;
             Ok::<_, bluer::Error>((gatt, advertisement))
         };
         let (gatt, advertisement) = match served.await {
@@ -181,10 +203,22 @@ impl NearbyAdvertiser {
 
         info!("{INNER_NAME}: advertising {name:?} on {address}");
         Ok(Active {
-            advertisement,
+            advertisement: Some(advertisement),
             gatt,
             saved,
+            header,
         })
+    }
+
+    async fn advertise(&self, header: &[u8]) -> Result<AdvertisementHandle, bluer::Error> {
+        self.adapter
+            .advertise(Advertisement {
+                // Connectable, so scanners can read the GATT characteristic.
+                advertisement_type: Type::Peripheral,
+                service_data: [(NEARBY_SERVICE_UUID, header.to_vec())].into(),
+                ..Default::default()
+            })
+            .await
     }
 
     /// Turns on discoverability (and with it page scan) indefinitely.
@@ -210,6 +244,7 @@ impl NearbyAdvertiser {
 
     async fn stop(&self, active: Option<Active>) {
         let Some(active) = active else { return };
+        let advertising = active.advertisement.is_some();
         let before = self.adapter.active_advertising_instances().await;
         drop(active.advertisement);
         drop(active.gatt);
@@ -217,7 +252,7 @@ impl NearbyAdvertiser {
         if let Some(saved) = active.saved {
             // Same BlueZ issue as in `start`: wait for the advertisement to
             // be gone before touching discoverability.
-            if let Ok(before) = before {
+            if let (true, Ok(before)) = (advertising, before) {
                 for _ in 0..20 {
                     match self.adapter.active_advertising_instances().await {
                         Ok(n) if n < before => break,

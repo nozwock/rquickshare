@@ -64,6 +64,10 @@ pub struct RQS {
     pub visibility_sender: Arc<Mutex<watch::Sender<Visibility>>>,
     visibility_receiver: watch::Receiver<Visibility>,
 
+    // Whether we are looking for receivers (between `discovery` and
+    // `stop_discovery`).
+    discovering: watch::Sender<bool>,
+
     // Only used to send the info "a nearby device is sharing"
     ble_sender: broadcast::Sender<()>,
 
@@ -114,6 +118,7 @@ impl RQS {
             discovery_ctk: None,
             visibility_sender: Arc::new(Mutex::new(visibility_sender)),
             visibility_receiver,
+            discovering: watch::Sender::new(false),
             ble_sender,
             port_number,
             message_sender,
@@ -162,6 +167,7 @@ impl RQS {
                         endpoint_id[..4].try_into()?,
                         &DEVICE_NAME,
                         self.visibility_receiver.clone(),
+                        self.discovering.subscribe(),
                     )
                     .await
                     {
@@ -216,6 +222,7 @@ impl RQS {
 
         let ctk = CancellationToken::new();
         self.discovery_ctk = Some(ctk.clone());
+        self.discovering.send_replace(true);
 
         // Each medium reports into its own channel; one entry per endpoint
         // (merged across mediums) is forwarded to `sender`.
@@ -274,6 +281,7 @@ impl RQS {
             discovert_ctk.cancel();
             self.discovery_ctk = None;
         }
+        self.discovering.send_replace(false);
     }
 
     pub fn change_visibility(&mut self, nv: Visibility) {

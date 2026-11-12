@@ -51,6 +51,10 @@ impl BleAdvertiser {
         Advertisement {
             advertisement_type: bluer::adv::Type::Broadcast,
             service_data: [(service_uuid, adv_data.into())].into(),
+            // Like Android senders (low latency): receivers scan in short
+            // windows. BlueZ 5.64 ignores it unless bluetoothd runs with -E.
+            min_interval: Some(std::time::Duration::from_millis(100)),
+            max_interval: Some(std::time::Duration::from_millis(100)),
             ..Default::default()
         }
     }
