@@ -105,6 +105,13 @@ pub fn parse_regular(data: &[u8], service_id: &str) -> Result<NearbyAdvertisemen
     parse_connections(body, Some(&hash))
 }
 
+/// How long the regular advertisement starting with `data` is, once its
+/// 8-byte prefix is there.
+pub fn regular_len(data: &[u8]) -> Option<usize> {
+    let len = u32::from_be_bytes(data.get(4..8)?.try_into().ok()?) as usize;
+    Some(8 + len)
+}
+
 /// Builds a regular advertisement (the inverse of [`parse_regular`]) for an
 /// endpoint reachable over Bluetooth Classic at `bluetooth_address`.
 pub fn build_regular(

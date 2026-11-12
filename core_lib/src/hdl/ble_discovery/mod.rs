@@ -16,6 +16,7 @@ use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail};
+use bluer::gatt::remote::CharacteristicReadRequest;
 use bluer::{Adapter, AdapterEvent, Address, DiscoveryFilter, DiscoveryTransport, Session, Uuid};
 use futures::StreamExt;
 use tokio::sync::broadcast;
@@ -36,7 +37,9 @@ const ADVERTISEMENT_SLOT_0: Uuid = Uuid::from_u128(0x00000000_0000_3000_8000_000
 
 const GATT_TIMEOUT: Duration = Duration::from_secs(20);
 /// Don't hammer a device whose advertisement could not be read.
-const GATT_RETRY_AFTER: Duration = Duration::from_secs(15);
+const GATT_RETRY_AFTER: Duration = Duration::from_secs(3);
+/// Advertisements are a few dozen bytes; don't follow a bogus length.
+const MAX_ADVERTISEMENT_LEN: usize = 512;
 /// Visible receivers re-advertise every few seconds; forget silent ones.
 const STALE_AFTER: Duration = Duration::from_secs(30);
 const SWEEP_INTERVAL: Duration = Duration::from_secs(5);
@@ -197,7 +200,29 @@ impl BleDiscovery {
                 }
                 for characteristic in service.characteristics().await? {
                     if characteristic.uuid().await? == ADVERTISEMENT_SLOT_0 {
-                        let value = characteristic.read().await?;
+                        let mut value = characteristic.read().await?;
+                        // A read can stop short (at the ATT MTU) without
+                        // BlueZ continuing it: fetch the rest from where it
+                        // stopped.
+                        while let Some(len) = adv::regular_len(&value)
+                            .filter(|len| *len > value.len() && *len <= MAX_ADVERTISEMENT_LEN)
+                        {
+                            let more = characteristic
+                                .read_ext(&CharacteristicReadRequest {
+                                    offset: u16::try_from(value.len())?,
+                                    ..Default::default()
+                                })
+                                .await?;
+                            trace!(
+                                "{INNER_NAME}: {addr} short read, {} of {len} bytes, {} more",
+                                value.len(),
+                                more.len()
+                            );
+                            if more.is_empty() {
+                                break;
+                            }
+                            value.extend(more);
+                        }
                         trace!(
                             "{INNER_NAME}: {addr} advertisement read after {:?}",
                             started.elapsed()
