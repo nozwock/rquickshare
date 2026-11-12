@@ -64,6 +64,10 @@ pub struct RQS {
     pub visibility_sender: Arc<Mutex<watch::Sender<Visibility>>>,
     visibility_receiver: watch::Receiver<Visibility>,
 
+    // Whether we are looking for receivers (between `discovery` and
+    // `stop_discovery`).
+    discovering: watch::Sender<bool>,
+
     // Only used to send the info "a nearby device is sharing"
     ble_sender: broadcast::Sender<()>,
 
@@ -114,6 +118,7 @@ impl RQS {
             discovery_ctk: None,
             visibility_sender: Arc::new(Mutex::new(visibility_sender)),
             visibility_receiver,
+            discovering: watch::Sender::new(false),
             ble_sender,
             port_number,
             message_sender,
@@ -152,6 +157,30 @@ impl RQS {
             self.message_sender.clone(),
             send_channel.1,
         )?;
+        #[cfg(all(feature = "experimental", target_os = "linux"))]
+        {
+            match hdl::bluetooth::BluetoothServer::new().await {
+                Ok(bt) => {
+                    server.set_bluetooth(bt);
+                    // Only worth advertising if we can accept the connection.
+                    match hdl::NearbyAdvertiser::new(
+                        endpoint_id[..4].try_into()?,
+                        &DEVICE_NAME,
+                        self.visibility_receiver.clone(),
+                        self.discovering.subscribe(),
+                    )
+                    .await
+                    {
+                        Ok(advertiser) => {
+                            let ctk = ctoken.clone();
+                            tracker.spawn(async move { advertiser.run(ctk).await });
+                        }
+                        Err(err) => warn!("NearbyAdvertiser: {}", err),
+                    }
+                }
+                Err(err) => warn!("BluetoothServer: {}", err),
+            }
+        }
         let ctk = ctoken.clone();
         tracker.spawn(async move { server.run(ctk).await });
 
@@ -193,6 +222,18 @@ impl RQS {
 
         let ctk = CancellationToken::new();
         self.discovery_ctk = Some(ctk.clone());
+        self.discovering.send_replace(true);
+
+        // Each medium reports into its own channel; one entry per endpoint
+        // (merged across mediums) is forwarded to `sender`.
+        let (mdns_tx, mdns_rx) = broadcast::channel(16);
+        let (ble_tx, ble_rx) = broadcast::channel(16);
+        tracker.spawn(hdl::endpoint_merge::forward(
+            mdns_rx,
+            ble_rx,
+            sender,
+            ctk.clone(),
+        ));
 
         #[cfg(all(feature = "experimental", target_os = "linux"))]
         {
@@ -212,7 +253,24 @@ impl RQS {
             });
         }
 
-        let discovery = MDnsDiscovery::new(sender)?;
+        #[cfg(all(feature = "experimental", target_os = "linux"))]
+        {
+            let ctk_ble = ctk.clone();
+            tracker.spawn(async move {
+                match hdl::BleDiscovery::new(ble_tx).await {
+                    Ok(discovery) => {
+                        if let Err(e) = discovery.run(ctk_ble).await {
+                            error!("BleDiscovery: {}", e);
+                        }
+                    }
+                    Err(e) => warn!("Couldn't init BleDiscovery: {}", e),
+                }
+            });
+        }
+        #[cfg(not(all(feature = "experimental", target_os = "linux")))]
+        drop(ble_tx);
+
+        let discovery = MDnsDiscovery::new(mdns_tx)?;
         tracker.spawn(async move { discovery.run(ctk.clone()).await });
 
         Ok(())
@@ -223,6 +281,7 @@ impl RQS {
             discovert_ctk.cancel();
             self.discovery_ctk = None;
         }
+        self.discovering.send_replace(false);
     }
 
     pub fn change_visibility(&mut self, nv: Visibility) {

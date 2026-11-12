@@ -12,10 +12,23 @@ mod ble;
 #[cfg(feature = "experimental")]
 pub use ble::*;
 #[cfg(all(feature = "experimental", target_os = "linux"))]
+mod ble_discovery;
+#[cfg(all(feature = "experimental", target_os = "linux"))]
 mod blea;
 #[cfg(all(feature = "experimental", target_os = "linux"))]
+pub use ble_discovery::BleDiscovery;
+#[cfg(all(feature = "experimental", target_os = "linux"))]
+pub mod bluetooth;
+#[cfg(all(feature = "experimental", target_os = "linux"))]
 pub use blea::*;
+#[cfg(all(feature = "experimental", target_os = "linux"))]
+mod nearby_advertiser;
+#[cfg(all(feature = "experimental", target_os = "linux"))]
+pub use nearby_advertiser::NearbyAdvertiser;
+pub(crate) mod bwu;
+pub(crate) mod endpoint_merge;
 mod inbound;
+mod nm;
 pub use inbound::*;
 pub mod info;
 mod mdns_discovery;
@@ -24,6 +37,8 @@ mod mdns;
 pub use mdns::*;
 mod outbound;
 pub use outbound::*;
+pub mod transport;
+pub use transport::{Transport, TransportStream};
 
 #[allow(dead_code)]
 #[derive(Debug, Clone, Default, PartialEq)]
