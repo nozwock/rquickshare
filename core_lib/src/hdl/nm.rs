@@ -195,13 +195,14 @@ mod linux {
             let conn = Connection::new_system()
                 .map_err(|e| anyhow!("connecting to the system bus: {e}"))?;
             delete_leftovers(&conn);
+            let gateway = profile.host.then(hotspot_gateway).flatten();
             let nm = proxy(&conn, NM_PATH);
             let device_path = Path::from(device.path.clone());
             let added: Result<(Path<'static>, Path<'static>, PropMap), _> = nm.method_call(
                 NM,
                 "AddAndActivateConnection2",
                 (
-                    settings(&device, &profile),
+                    settings(&device, &profile, gateway),
                     device_path.clone(),
                     Path::from("/"),
                     PropMap::from([
@@ -218,7 +219,11 @@ mod linux {
                         .method_call(
                             NM,
                             "AddAndActivateConnection",
-                            (settings(&device, &profile), device_path, Path::from("/")),
+                            (
+                                settings(&device, &profile, gateway),
+                                device_path,
+                                Path::from("/"),
+                            ),
                         )
                         .map_err(|e| anyhow!("NetworkManager: {e}"))?;
                     (connection, active)
@@ -298,7 +303,33 @@ mod linux {
         }
     }
 
-    fn settings(device: &WifiDevice, profile: &WifiProfile) -> HashMap<String, PropMap> {
+    /// Picks the address to host on, or `None` to leave it to
+    /// NetworkManager.
+    ///
+    /// NetworkManager always hosts on 10.42.0.1/24 by default. That is also
+    /// where k3s puts its pod network (`cni0`), and with the subnet taken the
+    /// phone joins but never reaches us.
+    fn hotspot_gateway() -> Option<Ipv4Addr> {
+        let routes = std::fs::read_to_string("/proc/net/route")
+            .inspect_err(|e| debug!("bwu: reading routes: {e}"))
+            .ok()?;
+        let routes = parse_routes(&routes);
+        let gateway = free_subnet(&routes);
+        match gateway {
+            Some(gw) if gw != DEFAULT_GATEWAY => {
+                info!("bwu: {DEFAULT_GATEWAY}/24 is in use, hosting on {gw}/24")
+            }
+            Some(_) => {}
+            None => warn!("bwu: every hotspot subnet we try is in use"),
+        }
+        gateway
+    }
+
+    fn settings(
+        device: &WifiDevice,
+        profile: &WifiProfile,
+        gateway: Option<Ipv4Addr>,
+    ) -> HashMap<String, PropMap> {
         let mut connection = PropMap::from([
             ("id".to_string(), v(profile.name.clone())),
             ("uuid".to_string(), v(random_uuid())),
@@ -339,7 +370,18 @@ mod linux {
         }
 
         let ipv4 = if profile.host {
-            PropMap::from([("method".to_string(), v("shared".to_string()))])
+            let mut ipv4 = PropMap::from([("method".to_string(), v("shared".to_string()))]);
+            if let Some(gateway) = gateway {
+                // NetworkManager hands out addresses from this subnet.
+                ipv4.insert(
+                    "address-data".into(),
+                    v(vec![PropMap::from([
+                        ("address".to_string(), v(gateway.to_string())),
+                        ("prefix".to_string(), v(24u32)),
+                    ])]),
+                );
+            }
+            ipv4
         } else {
             PropMap::from([
                 ("method".to_string(), v("auto".to_string())),
@@ -358,6 +400,52 @@ mod linux {
                 PropMap::from([("method".to_string(), v("ignore".to_string()))]),
             ),
         ])
+    }
+
+    /// NetworkManager's own choice.
+    const DEFAULT_GATEWAY: Ipv4Addr = Ipv4Addr::new(10, 42, 0, 1);
+    /// Where to host, in order. These avoid what Docker (172.17/16) and
+    /// Android's Wi-Fi Direct groups (192.168.49/24) use.
+    const HOTSPOT_GATEWAYS: [Ipv4Addr; 6] = [
+        DEFAULT_GATEWAY,
+        Ipv4Addr::new(192, 168, 42, 1),
+        Ipv4Addr::new(192, 168, 43, 1),
+        Ipv4Addr::new(192, 168, 44, 1),
+        Ipv4Addr::new(192, 168, 45, 1),
+        Ipv4Addr::new(172, 31, 42, 1),
+    ];
+
+    /// Destination and netmask of each route in `/proc/net/route`.
+    fn parse_routes(table: &str) -> Vec<(Ipv4Addr, Ipv4Addr)> {
+        // Addresses are the kernel's __be32 printed as a native integer.
+        let addr = |hex: &str| {
+            u32::from_str_radix(hex, 16)
+                .ok()
+                .map(|n| Ipv4Addr::from(n.to_ne_bytes()))
+        };
+        table
+            .lines()
+            .skip(1)
+            .filter_map(|line| {
+                let fields: Vec<&str> = line.split_whitespace().collect();
+                Some((addr(fields.get(1)?)?, addr(fields.get(7)?)?))
+            })
+            .collect()
+    }
+
+    /// The first of [`HOTSPOT_GATEWAYS`] whose /24 no route overlaps,
+    /// ignoring default routes.
+    fn free_subnet(routes: &[(Ipv4Addr, Ipv4Addr)]) -> Option<Ipv4Addr> {
+        const PREFIX_24: u32 = 0xffff_ff00;
+        HOTSPOT_GATEWAYS.into_iter().find(|gw| {
+            let subnet = u32::from(*gw) & PREFIX_24;
+            !routes.iter().any(|(dest, mask)| {
+                let mask = u32::from(*mask);
+                // Two subnets overlap if they agree on the shorter prefix.
+                let shorter = mask & PREFIX_24;
+                mask != 0 && subnet & shorter == u32::from(*dest) & shorter
+            })
+        })
     }
 
     fn random_uuid() -> String {
@@ -390,6 +478,54 @@ mod linux {
                 .to_str()
                 .ok()
                 .map(String::from)
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        // From a k3s node: its pod network sits where NetworkManager would
+        // host by default.
+        const K3S_ROUTES: &str = "\
+Iface\tDestination\tGateway \tFlags\tRefCnt\tUse\tMetric\tMask\t\tMTU\tWindow\tIRTT
+wls5f3\t00000000\t0100A8C0\t0003\t0\t0\t600\t00000000\t0\t0\t0
+cni0\t00002A0A\t00000000\t0001\t0\t0\t0\t00FFFFFF\t0\t0\t0
+flannel.1\t00012A0A\t00012A0A\t0003\t0\t0\t0\t00FFFFFF\t0\t0\t0
+wls5f3\t0000A8C0\t00000000\t0001\t0\t0\t600\t00FFFFFF\t0\t0\t0
+";
+
+        #[test]
+        fn parses_route_table() {
+            let routes = parse_routes(K3S_ROUTES);
+            assert_eq!(routes.len(), 4);
+            assert_eq!(
+                routes[1],
+                (Ipv4Addr::new(10, 42, 0, 0), Ipv4Addr::new(255, 255, 255, 0))
+            );
+        }
+
+        #[test]
+        fn keeps_the_default_subnet_when_free() {
+            let routes = parse_routes(K3S_ROUTES);
+            // Only the default route and the LAN.
+            let lan = [routes[0], routes[3]];
+            assert_eq!(free_subnet(&lan), Some(DEFAULT_GATEWAY));
+        }
+
+        #[test]
+        fn avoids_a_taken_subnet() {
+            let routes = parse_routes(K3S_ROUTES);
+            assert_eq!(free_subnet(&routes), Some(Ipv4Addr::new(192, 168, 42, 1)));
+        }
+
+        #[test]
+        fn avoids_subnets_inside_a_wider_route() {
+            let routes = [
+                (Ipv4Addr::new(10, 0, 0, 0), Ipv4Addr::new(255, 0, 0, 0)),
+                (Ipv4Addr::new(192, 168, 0, 0), Ipv4Addr::new(255, 255, 0, 0)),
+            ];
+            assert_eq!(free_subnet(&routes), Some(Ipv4Addr::new(172, 31, 42, 1)));
         }
     }
 }
